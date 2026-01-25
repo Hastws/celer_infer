@@ -427,10 +427,7 @@ static void write_f32(const std::string& path, const float* x, size_t n) {
 }
 
 int main(int argc, char** argv) {
-  const std::string dump_dir =
-      (argc >= 2)
-          ? argv[1]
-          : "/Users/hastws/work_space_github_myself/CelerInfer/dump_minimind";
+  const std::string dump_dir = (argc >= 2) ? argv[1] : "dump_minimind";
 
   // ===== 读取 meta.txt 手动对齐（这里直接 hardcode，和 Python 默认一致）=====
   // 你如果改了 Python 的环境变量，就把这里跟着改。
