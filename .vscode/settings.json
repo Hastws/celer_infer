@@ -1,0 +1,4 @@
+{
+  "python.defaultInterpreterPath": "${userHome}/miniconda3/envs/CelerInfer/bin/python",
+  "python.terminal.activateEnvironment": true
+}
