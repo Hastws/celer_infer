@@ -590,12 +590,14 @@ int main(int argc, char** argv) {
   float* k_data = new float[B * S * kv_heads * head_dim]();
   float* v_data = new float[B * S * kv_heads * head_dim]();
 
-  float* k_rep_data = new float[B * T * kv_heads * head_dim]();
-  float* v_rep_data = new float[B * T * kv_heads * head_dim]();
+  // repeat_kv 输出的是 (B, T, heads, D)，不是 (B, T, kv_heads, D)
+  float* k_rep_data = new float[B * T * heads * head_dim]();
+  float* v_rep_data = new float[B * T * heads * head_dim]();
 
   float* q_bhsd_data = new float[B * heads * S * head_dim]();
-  float* k_bhtd_data = new float[B * kv_heads * T * head_dim]();
-  float* v_bhtd_data = new float[B * kv_heads * T * head_dim]();
+  // transpose 后输出的是 (B, H, T, D)，H = heads，不是 kv_heads
+  float* k_bhtd_data = new float[B * heads * T * head_dim]();
+  float* v_bhtd_data = new float[B * heads * T * head_dim]();
 
   float* scores_data = new float[B * heads * S * T]();
   float* probs_data = new float[B * heads * S * T]();

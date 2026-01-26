@@ -42,7 +42,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y build-essential cmake
 
-    - name: 🚀 一键验证 PyTorch ↔ C++ 一致性
+    - name: 🚀 一键验证 PyTorch ↔ C++ 一致性 (多测试用例)
       run: |
         python -m python.tools.verify_consistency --atol 1e-3 --rtol 1e-3
         
@@ -78,15 +78,21 @@ jobs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "| 步骤 | 状态 |" >> $GITHUB_STEP_SUMMARY
         echo "|------|------|" >> $GITHUB_STEP_SUMMARY
-        echo "| 一键验证 (verify_consistency) | ✅ 通过 |" >> $GITHUB_STEP_SUMMARY
+        echo "| 多测试用例验证 (9个用例) | ✅ 通过 |" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### 验证流程" >> $GITHUB_STEP_SUMMARY
-        echo "1. C++ 编译" >> $GITHUB_STEP_SUMMARY
-        echo "2. 模型权重导出 → \`dump_minimind/minimind.json\`" >> $GITHUB_STEP_SUMMARY
-        echo "3. PyTorch 推理 → \`dump_minimind/logits_torch.npy\`" >> $GITHUB_STEP_SUMMARY
-        echo "4. C++ 推理 → \`dump_minimind/logits_cpp.npy\`" >> $GITHUB_STEP_SUMMARY
-        echo "5. 输出比较 (atol=1e-3, rtol=1e-3)" >> $GITHUB_STEP_SUMMARY
+        echo "### 测试用例覆盖" >> $GITHUB_STEP_SUMMARY
+        echo "| 用例 | Batch | Seq | 说明 |" >> $GITHUB_STEP_SUMMARY
+        echo "|------|-------|-----|------|" >> $GITHUB_STEP_SUMMARY
+        echo "| basic | 2 | 5 | 默认测试 |" >> $GITHUB_STEP_SUMMARY
+        echo "| batch1 | 1 | 8 | 单batch长序列 |" >> $GITHUB_STEP_SUMMARY
+        echo "| batch4 | 4 | 3 | 多batch短序列 |" >> $GITHUB_STEP_SUMMARY
+        echo "| square | 4 | 4 | 方形张量 |" >> $GITHUB_STEP_SUMMARY
+        echo "| batch8 | 8 | 16 | 较大输入 |" >> $GITHUB_STEP_SUMMARY
+        echo "| short | 2 | 2 | 短序列 |" >> $GITHUB_STEP_SUMMARY
+        echo "| mid | 3 | 7 | 中等大小 |" >> $GITHUB_STEP_SUMMARY
+        echo "| edge1 | 1 | 1 | 最小输入 (边界) |" >> $GITHUB_STEP_SUMMARY
+        echo "| long | 1 | 32 | 长序列 (边界) |" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### 验证标准" >> $GITHUB_STEP_SUMMARY
         echo "- 最大绝对误差 < 0.001" >> $GITHUB_STEP_SUMMARY
-        echo "- 当前测试: max_error ≈ 0.0005" >> $GITHUB_STEP_SUMMARY
+        echo "- 所有测试用例: max_error ≈ 3e-4 ~ 5e-4" >> $GITHUB_STEP_SUMMARY
