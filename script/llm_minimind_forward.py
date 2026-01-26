@@ -1,171 +1,217 @@
+#!/usr/bin/env python3
+"""
+Load a JSON model (from generate_random_model.py) and run forward pass.
+Measures timing (excluding JSON loading).
+Saves logits for comparison/verification.
+"""
+
 import os
-import struct
+import json
+import base64
+import time
+from typing import Any, Dict
+
 import numpy as np
 import torch
 
 from llm_minimind_model import MiniMindConfig, MiniMindForCausalLM
 
 
-def save_f32(path: str, x: np.ndarray) -> None:
-    x = np.asarray(x, dtype=np.float32)
-    x.tofile(path)
+def _b64_decode_to_numpy(t: Dict[str, Any]) -> np.ndarray:
+    assert t["encoding"] == "base64"
+    raw = base64.b64decode(t["data"])
+    dtype = np.dtype(t["dtype"])
+    shape = tuple(int(x) for x in t["shape"])
+    arr = np.frombuffer(raw, dtype=dtype).copy()
+    return arr.reshape(shape)
 
 
-def save_i32(path: str, x: np.ndarray) -> None:
-    x = np.asarray(x, dtype=np.int32)
-    x.tofile(path)
+def _load_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def save_u8(path: str, x: np.ndarray) -> None:
-    x = np.asarray(x, dtype=np.uint8)
-    x.tofile(path)
+def _build_cfg(cfg_j: Dict[str, Any]) -> MiniMindConfig:
+    cfg = MiniMindConfig(
+        dropout=float(cfg_j["dropout"]),
+        hidden_size=int(cfg_j["hidden_size"]),
+        num_hidden_layers=int(cfg_j["num_hidden_layers"]),
+        num_attention_heads=int(cfg_j["num_attention_heads"]),
+        num_key_value_heads=int(cfg_j["num_key_value_heads"]),
+        vocab_size=int(cfg_j["vocab_size"]),
+        max_position_embeddings=int(cfg_j["max_position_embeddings"]),
+        rms_norm_eps=float(cfg_j["rms_norm_eps"]),
+        rope_theta=float(cfg_j["rope_theta"]),
+        inference_rope_scaling=bool(cfg_j["inference_rope_scaling"]),
+        flash_attn=bool(cfg_j["flash_attn"]),
+        use_moe=bool(cfg_j["use_moe"]),
+        intermediate_size=int(cfg_j.get("intermediate_size", 0)),
+    )
+    return cfg
 
 
-def fill_param(param: torch.Tensor, rng: np.random.RandomState, scale: float = 0.02) -> None:
-    arr = rng.standard_normal(size=tuple(param.shape)).astype(np.float32) * scale
-    with torch.no_grad():
-        param.copy_(torch.from_numpy(arr))
-
-
-def main():
-    dump_dir = os.environ.get("DUMP_DIR", "dump_minimind")
+def main() -> None:
+    json_path = os.environ.get("JSON_PATH", "dump_minimind/minimind.json")
+    dump_dir = os.environ.get("DUMP_DIR", os.path.dirname(json_path) or ".")
     os.makedirs(dump_dir, exist_ok=True)
 
-    # ========= 配一套“易调试”的小配置（你要换成 512/8 层也行） =========
-    seed = int(os.environ.get("SEED", "123"))
-    B = int(os.environ.get("B", "2"))
-    S = int(os.environ.get("S", "5"))
-
-    cfg = MiniMindConfig(
-        dropout=0.0,
-        hidden_size=int(os.environ.get("HIDDEN", "64")),
-        num_hidden_layers=int(os.environ.get("LAYERS", "2")),
-        num_attention_heads=int(os.environ.get("HEADS", "8")),
-        num_key_value_heads=int(os.environ.get("KVH", "2")),
-        vocab_size=int(os.environ.get("VOCAB", "128")),
-        max_position_embeddings=int(os.environ.get("MAX_POS", "128")),
-        rms_norm_eps=1e-5,
-        rope_theta=1_000_000.0,
-        inference_rope_scaling=False,
-        flash_attn=False,  # 关键：强制走 slow attention
-        use_moe=False,
-    )
-
     torch.set_default_dtype(torch.float32)
-    torch.set_num_threads(1)  # 想更确定就单线程
-    torch.manual_seed(seed)
-    np_rng = np.random.RandomState(seed)
+    torch.set_num_threads(1)
 
+    # --------- load json (NOT timed) ----------
+    print(f"Loading JSON from: {json_path}")
+    j = _load_json(json_path)
+
+    cfg = _build_cfg(j["config"])
     model = MiniMindForCausalLM(cfg).eval().cpu()
 
-    # FeedForward 会把 config.intermediate_size 补齐，这里拿到最终 inter
-    inter = int(model.config.intermediate_size)
+    print(
+        f"Config: hidden={cfg.hidden_size}, layers={cfg.num_hidden_layers}, "
+        f"heads={cfg.num_attention_heads}, vocab={cfg.vocab_size}"
+    )
 
-    # ========= 生成 input_ids / attention_mask =========
-    input_ids = np_rng.randint(0, cfg.vocab_size, size=(B, S), dtype=np.int32)
-    attn_mask = np.ones((B, S), dtype=np.uint8)  # 本次测试不带 padding，全 1
+    # inputs
+    input_ids = _b64_decode_to_numpy(j["inputs"]["input_ids"]).astype(np.int32)
+    attn_mask = _b64_decode_to_numpy(j["inputs"]["attention_mask"]).astype(np.uint8)
 
-    save_i32(os.path.join(dump_dir, "input_ids_i32.bin"), input_ids)
-    save_u8(os.path.join(dump_dir, "attn_mask_u8.bin"), attn_mask)
-
-    # ========= 用同一 RNG 填充权重（保证 embedding / lm_head 完全一致） =========
-    # embedding + lm_head（共享）
-    fill_param(model.model.embed_tokens.weight, np_rng)
-    with torch.no_grad():
-        model.lm_head.weight.copy_(model.model.embed_tokens.weight)
-
-    # layer weights
-    for l in range(cfg.num_hidden_layers):
-        blk = model.model.layers[l]
-        fill_param(blk.input_layernorm.weight, np_rng)  # rms_attn
-        fill_param(blk.post_attention_layernorm.weight, np_rng)  # rms_ffn
-
-        attn = blk.self_attn
-        fill_param(attn.q_proj.weight, np_rng)
-        fill_param(attn.k_proj.weight, np_rng)
-        fill_param(attn.v_proj.weight, np_rng)
-        fill_param(attn.o_proj.weight, np_rng)
-
-        mlp = blk.mlp
-        # 非 MoE
-        fill_param(mlp.gate_proj.weight, np_rng)
-        fill_param(mlp.up_proj.weight, np_rng)
-        fill_param(mlp.down_proj.weight, np_rng)
-
-    # final norm
-    fill_param(model.model.norm.weight, np_rng)
-
-    # ========= dump rope cos/sin（来自模型缓冲区） =========
-    freqs_cos = model.model.freqs_cos.detach().cpu().to(torch.float32).numpy()
-    freqs_sin = model.model.freqs_sin.detach().cpu().to(torch.float32).numpy()
-    # freqs_cos/sin shape: (max_pos, head_dim) 其中 head_dim = hidden/heads
-    save_f32(os.path.join(dump_dir, "rope_cos_f32.bin"), freqs_cos)
-    save_f32(os.path.join(dump_dir, "rope_sin_f32.bin"), freqs_sin)
-
-    # ========= dump 所有权重（raw float32） =========
-    save_f32(os.path.join(dump_dir, "tok_embedding_f32.bin"),
-             model.model.embed_tokens.weight.detach().cpu().numpy())
-    save_f32(os.path.join(dump_dir, "final_rms_f32.bin"),
-             model.model.norm.weight.detach().cpu().numpy())
-    save_f32(os.path.join(dump_dir, "lm_head_f32.bin"),
-             model.lm_head.weight.detach().cpu().numpy())
-
-    for l in range(cfg.num_hidden_layers):
-        blk = model.model.layers[l]
-        attn = blk.self_attn
-        mlp = blk.mlp
-
-        save_f32(os.path.join(dump_dir, f"layer{l}_rms_attn.bin"),
-                 blk.input_layernorm.weight.detach().cpu().numpy())
-        save_f32(os.path.join(dump_dir, f"layer{l}_rms_ffn.bin"),
-                 blk.post_attention_layernorm.weight.detach().cpu().numpy())
-
-        save_f32(os.path.join(dump_dir, f"layer{l}_wq.bin"),
-                 attn.q_proj.weight.detach().cpu().numpy())
-        save_f32(os.path.join(dump_dir, f"layer{l}_wk.bin"),
-                 attn.k_proj.weight.detach().cpu().numpy())
-        save_f32(os.path.join(dump_dir, f"layer{l}_wv.bin"),
-                 attn.v_proj.weight.detach().cpu().numpy())
-        save_f32(os.path.join(dump_dir, f"layer{l}_wo.bin"),
-                 attn.o_proj.weight.detach().cpu().numpy())
-
-        save_f32(os.path.join(dump_dir, f"layer{l}_w_gate.bin"),
-                 mlp.gate_proj.weight.detach().cpu().numpy())
-        save_f32(os.path.join(dump_dir, f"layer{l}_w_up.bin"),
-                 mlp.up_proj.weight.detach().cpu().numpy())
-        save_f32(os.path.join(dump_dir, f"layer{l}_w_down.bin"),
-                 mlp.down_proj.weight.detach().cpu().numpy())
-
-    # ========= 写一份纯文本 meta，给 C++ 直接 hardcode/核对 =========
-    meta_txt = f"""seed={seed}
-B={B}
-S={S}
-vocab={cfg.vocab_size}
-hidden={cfg.hidden_size}
-layers={cfg.num_hidden_layers}
-heads={cfg.num_attention_heads}
-kv_heads={cfg.num_key_value_heads}
-head_dim={cfg.hidden_size // cfg.num_attention_heads}
-inter={inter}
-max_pos={cfg.max_position_embeddings}
-"""
-    with open(os.path.join(dump_dir, "meta.txt"), "w", encoding="utf-8") as f:
-        f.write(meta_txt)
-
-    # ========= 跑 forward =========
     input_ids_t = torch.from_numpy(input_ids).to(torch.long)
-    attn_mask_t = torch.from_numpy(attn_mask).to(torch.long)  # python 里 attention_mask 用 0/1 float/long 都行
+    attn_mask_t = torch.from_numpy(attn_mask.astype(np.int64))
 
+    # weights (NOT timed)
+    w = j["weights"]
     with torch.no_grad():
-        out = model(input_ids=input_ids_t, attention_mask=attn_mask_t,
-                    use_cache=False, logits_to_keep=0)
-        logits = out.logits.detach().cpu().to(torch.float32).numpy()
+        model.model.embed_tokens.weight.copy_(
+            torch.from_numpy(
+                _b64_decode_to_numpy(w["tok_embedding"]).astype(np.float32)
+            )
+        )
+        model.model.norm.weight.copy_(
+            torch.from_numpy(_b64_decode_to_numpy(w["final_rms"]).astype(np.float32))
+        )
+        model.lm_head.weight.copy_(
+            torch.from_numpy(_b64_decode_to_numpy(w["lm_head"]).astype(np.float32))
+        )
 
-    save_f32(os.path.join(dump_dir, "py_logits_f32.bin"), logits)
+        for l, layer_j in enumerate(w["layers"]):
+            blk = model.model.layers[l]
+            attn = blk.self_attn
+            mlp = blk.mlp
 
-    print("[OK] Dumped to:", dump_dir)
-    print("logits shape:", logits.shape)
-    print(open(os.path.join(dump_dir, "meta.txt"), "r", encoding="utf-8").read())
+            blk.input_layernorm.weight.copy_(
+                torch.from_numpy(
+                    _b64_decode_to_numpy(layer_j["rms_attn"]).astype(np.float32)
+                )
+            )
+            blk.post_attention_layernorm.weight.copy_(
+                torch.from_numpy(
+                    _b64_decode_to_numpy(layer_j["rms_ffn"]).astype(np.float32)
+                )
+            )
+
+            attn.q_proj.weight.copy_(
+                torch.from_numpy(_b64_decode_to_numpy(layer_j["wq"]).astype(np.float32))
+            )
+            attn.k_proj.weight.copy_(
+                torch.from_numpy(_b64_decode_to_numpy(layer_j["wk"]).astype(np.float32))
+            )
+            attn.v_proj.weight.copy_(
+                torch.from_numpy(_b64_decode_to_numpy(layer_j["wv"]).astype(np.float32))
+            )
+            attn.o_proj.weight.copy_(
+                torch.from_numpy(_b64_decode_to_numpy(layer_j["wo"]).astype(np.float32))
+            )
+
+            mlp.gate_proj.weight.copy_(
+                torch.from_numpy(
+                    _b64_decode_to_numpy(layer_j["w_gate"]).astype(np.float32)
+                )
+            )
+            mlp.up_proj.weight.copy_(
+                torch.from_numpy(
+                    _b64_decode_to_numpy(layer_j["w_up"]).astype(np.float32)
+                )
+            )
+            mlp.down_proj.weight.copy_(
+                torch.from_numpy(
+                    _b64_decode_to_numpy(layer_j["w_down"]).astype(np.float32)
+                )
+            )
+
+        # rope (optional: overwrite buffers to guarantee exact)
+        rope_cos = _b64_decode_to_numpy(j["rope"]["cos"]).astype(np.float32)
+        rope_sin = _b64_decode_to_numpy(j["rope"]["sin"]).astype(np.float32)
+        model.model.freqs_cos.copy_(torch.from_numpy(rope_cos))
+        model.model.freqs_sin.copy_(torch.from_numpy(rope_sin))
+
+    print("[OK] Weights loaded from JSON")
+
+    # --------- forward timed only ----------
+    warmup = int(os.environ.get("WARMUP", "1"))
+    if warmup > 0:
+        print(f"Running {warmup} warmup iterations...")
+        with torch.no_grad():
+            _ = model(
+                input_ids=input_ids_t,
+                attention_mask=attn_mask_t,
+                use_cache=False,
+                logits_to_keep=0,
+            )
+
+    # Time the forward pass (excluding JSON loading)
+    print("Running timed forward pass...")
+    start_time = time.time()
+    with torch.no_grad():
+        out = model(
+            input_ids=input_ids_t,
+            attention_mask=attn_mask_t,
+            use_cache=False,
+            logits_to_keep=0,
+        )
+    elapsed = time.time() - start_time
+
+    logits = out.logits.detach().cpu().to(torch.float32).numpy()  # (B, S, V)
+
+    # Print results
+    print()
+    print("=" * 60)
+    print("[Forward] Shape: {}, Dtype: {}".format(logits.shape, logits.dtype))
+    print("[Timing] Forward pass: {:.2f}ms (warmup={})".format(elapsed * 1000, warmup))
+    print(
+        "[Logits] Min: {:.6f}, Max: {:.6f}, Mean: {:.6f}".format(
+            logits.min(), logits.max(), logits.mean()
+        )
+    )
+    print("=" * 60)
+    print()
+
+    # Save logits
+    logits_path = os.path.join(dump_dir, "logits_torch.npy")
+    np.save(logits_path, logits)
+    print("[OK] Saved logits to: {}".format(logits_path))
+
+    # Save embedding output for debugging
+    print("\n[DEBUG] Extracting embedding output for comparison...")
+    with torch.no_grad():
+        # Get embedding layer output (model.model.embed_tokens)
+        h0_emb = model.model.embed_tokens(input_ids_t)  # (B, S, hidden)
+        # Also apply dropout like the model does
+        h0 = model.model.dropout(h0_emb)
+        h0_np = h0.cpu().numpy()
+        h0_path = os.path.join(dump_dir, "h0_torch.npy")
+        np.save(h0_path, h0_np)
+        print(
+            "[DEBUG] Saved h0 (embedding output after dropout) to: {}".format(h0_path)
+        )
+        print(
+            "[DEBUG] h0 shape: {}, min: {:.6f}, max: {:.6f}, mean: {:.6f}".format(
+                h0_np.shape, h0_np.min(), h0_np.max(), h0_np.mean()
+            )
+        )
+
+    # Save intermediate layer outputs using hooks
+    print(
+        "[DEBUG] Layer 0 intermediate outputs - skipping (requires model modification)"
+    )
 
 
 if __name__ == "__main__":

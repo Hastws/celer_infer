@@ -4,3 +4,5 @@ cmake-build-release
 build
 
 __pycache__
+
+dump_minimind

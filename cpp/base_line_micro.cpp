@@ -6,6 +6,22 @@
 
 using namespace celer_infer;
 
+// Global to store h0_embedding for debugging
+std::vector<float> g_h0_embedding;
+std::vector<float> g_h_norm_l0;         // After RMSNorm in layer 0
+std::vector<float> g_h1_attn_l0;        // After attention in layer 0
+std::vector<float> g_h0_ffn_l0;         // After FFN in layer 0
+std::vector<float> g_q_flat_l0;         // Q projections in layer 0
+std::vector<float> g_k_flat_l0;         // K projections in layer 0
+std::vector<float> g_v_flat_l0;         // V projections in layer 0
+std::vector<float> g_scores_l0;         // Attention scores in layer 0
+std::vector<float> g_probs_l0;          // Attention probabilities after softmax
+std::vector<float> g_attn_out_flat_l0;  // Attention output after merging heads
+std::vector<float> g_attn_proj_l0;  // After w_o projection (before residual)
+std::vector<float> g_ffn_norm_l0;   // After FFN RMSNorm
+std::vector<float> g_ffn_out_l0;  // After FFN down projection (before residual)
+std::string g_dump_dir;
+
 // ============================
 // Model wiring structs (all pointers, no fancy tensor class)
 // ============================
@@ -153,17 +169,32 @@ inline void minimind_attention_forward_infer(
   if (lw.b_q)
     add_bias_lastdim_inplace(ws->attn_out_flat, B * S, H * D, lw.b_q, H * D);
 
+  // Save Q projection for layer 0
+  if (layer_id == 0) {
+    g_q_flat_l0.assign(ws->attn_out_flat, ws->attn_out_flat + B * S * H * D);
+  }
+
   // k_flat:
   matmul_nt(ws->h1, B * S, HIDDEN, lw.w_k, KVH * D, HIDDEN, ws->ffn_mid, B * S,
             KVH * D);
   if (lw.b_k)
     add_bias_lastdim_inplace(ws->ffn_mid, B * S, KVH * D, lw.b_k, KVH * D);
 
+  // Save K projection for layer 0
+  if (layer_id == 0) {
+    g_k_flat_l0.assign(ws->ffn_mid, ws->ffn_mid + B * S * KVH * D);
+  }
+
   // v_flat:
   matmul_nt(ws->h1, B * S, HIDDEN, lw.w_v, KVH * D, HIDDEN, ws->ffn_up, B * S,
             KVH * D);
   if (lw.b_v)
     add_bias_lastdim_inplace(ws->ffn_up, B * S, KVH * D, lw.b_v, KVH * D);
+
+  // Save V projection for layer 0
+  if (layer_id == 0) {
+    g_v_flat_l0.assign(ws->ffn_up, ws->ffn_up + B * S * KVH * D);
+  }
 
   // 3) view to (B,S,H,D) and (B,S,KVH,D)
   // q: ws->q uses (B,S,H,D)
@@ -241,6 +272,11 @@ inline void minimind_attention_forward_infer(
                  1.0f / std::sqrt(static_cast<float>(D)), ws->scores, B, H, S,
                  cat_T);
 
+  // Save attention scores for layer 0
+  if (layer_id == 0) {
+    g_scores_l0.assign(ws->scores, ws->scores + B * H * S * cat_T);
+  }
+
   // 9) causal mask with prefix_offset=past
   apply_causal_mask(ws->scores, B, H, S, cat_T, past);
 
@@ -252,6 +288,11 @@ inline void minimind_attention_forward_infer(
 
   // 11) softmax over last dim T
   attn_softmax_scores(ws->scores, B, H, S, cat_T, ws->probs, B, H, S, cat_T);
+
+  // Save attention probabilities for layer 0
+  if (layer_id == 0) {
+    g_probs_l0.assign(ws->probs, ws->probs + B * H * S * cat_T);
+  }
 
   // 12) attn_out = probs @ v
   attn_pv_matmul(ws->probs, B, H, S, cat_T, ws->v_bhtd, B, H, cat_T, D,
@@ -270,14 +311,31 @@ inline void minimind_attention_forward_infer(
     }
   }
 
+  // Save merged attention output for layer 0
+  if (layer_id == 0) {
+    g_attn_out_flat_l0.assign(ws->attn_out_flat,
+                              ws->attn_out_flat + B * S * H * D);
+  }
+
   // 14) o_proj: (B,S,H*D)->(B,S,hidden)
-  matmul_nt(ws->attn_out_flat, B * S, H * D, lw.w_o, HIDDEN, H * D, ws->h1,
-            B * S, HIDDEN);
-  if (lw.b_o) add_bias_lastdim_inplace(ws->h1, B * S, HIDDEN, lw.b_o, HIDDEN);
+  // Use ws->attn_out_bshd as temporary buffer for o_proj (no longer needed
+  // after merge_heads)
+  matmul_nt(ws->attn_out_flat, B * S, H * D, lw.w_o, HIDDEN, H * D,
+            (float*)ws->attn_out_bshd, B * S, HIDDEN);
+  if (lw.b_o)
+    add_bias_lastdim_inplace((float*)ws->attn_out_bshd, B * S, HIDDEN, lw.b_o,
+                             HIDDEN);
+
+  // Save o_proj result for layer 0 (after bias, before residual)
+  if (layer_id == 0) {
+    g_attn_proj_l0.assign((float*)ws->attn_out_bshd,
+                          (float*)ws->attn_out_bshd + B * S * HIDDEN);
+  }
 
   // 15) residual: out = x + o_proj
   std::memcpy(out, x, static_cast<size_t>(B * S * HIDDEN) * sizeof(float));
-  add_inplace(out, B * S * HIDDEN, ws->h1, B * S * HIDDEN, 1.0f);
+  add_inplace(out, B * S * HIDDEN, (float*)ws->attn_out_bshd, B * S * HIDDEN,
+              1.0f);
 }
 
 inline void minimind_ffn_forward_infer(const minimind_config& cfg,
@@ -286,8 +344,20 @@ inline void minimind_ffn_forward_infer(const minimind_config& cfg,
                                        int64_t HIDDEN,  // x (B,S,hidden)
                                        minimind_workspace* ws, float* out) {
   // out (B,S,hidden)
+  // Save original input before RMSNorm
+  std::memcpy(out, x, static_cast<size_t>(B * S * HIDDEN) * sizeof(float));
+
   // pre-ffn rmsnorm
   rms_norm_lastdim(x, B * S, HIDDEN, lw.rms_ffn, HIDDEN, cfg.rms_eps, ws->h1);
+
+  // Save FFN norm output for layer 0 (for debugging)
+  // Note: This assumes we're in layer 0 - we would need to pass layer_id for
+  // proper check For now, just save if first call
+  static int ffn_call_count = 0;
+  if (ffn_call_count == 0) {
+    g_ffn_norm_l0.assign(ws->h1, ws->h1 + B * S * HIDDEN);
+    ffn_call_count++;
+  }
 
   // gate/up: (B,S,hidden)->(B,S,inter)
   matmul_nt(ws->h1, B * S, HIDDEN, lw.w_gate, cfg.inter, HIDDEN, ws->ffn_gate,
@@ -312,8 +382,15 @@ inline void minimind_ffn_forward_infer(const minimind_config& cfg,
   if (lw.b_down)
     add_bias_lastdim_inplace(ws->ffn_out, B * S, HIDDEN, lw.b_down, HIDDEN);
 
-  // residual
-  std::memcpy(out, x, static_cast<size_t>(B * S * HIDDEN) * sizeof(float));
+  // Save FFN down projection for layer 0 (before residual)
+  static int ffn_down_call_count = 0;
+  if (ffn_down_call_count == 0) {
+    g_ffn_out_l0.assign(ws->ffn_out, ws->ffn_out + B * S * HIDDEN);
+    ffn_down_call_count++;
+  }
+
+  // residual: out = out + ffn_out (out already contains x from beginning of
+  // function)
   add_inplace(out, B * S * HIDDEN, ws->ffn_out, B * S * HIDDEN, 1.0f);
 }
 
@@ -336,17 +413,70 @@ inline void minimind_forward_infer(const minimind_config& cfg,
   embedding_lookup_bsh(w.tok_embedding, cfg.vocab_size, cfg.hidden, input_ids,
                        B, S, ws->h0, B, S, cfg.hidden);
 
+  // Debug: Save h0 right after embedding for verification
+  {
+    std::cout << "[DEBUG] h0 after embedding lookup:\n";
+    std::cout << "  Shape: (" << B << ", " << S << ", " << cfg.hidden << ")\n";
+    std::cout << "  h0[0,0,:10] = ";
+    for (int i = 0; i < 10; ++i) {
+      std::cout << ws->h0[i] << " ";
+    }
+    std::cout << "\n";
+
+    // Find min/max
+    float h0_min = ws->h0[0], h0_max = ws->h0[0];
+    for (int64_t i = 0; i < B * S * cfg.hidden; ++i) {
+      h0_min = std::min(h0_min, ws->h0[i]);
+      h0_max = std::max(h0_max, ws->h0[i]);
+    }
+    std::cout << "  Min: " << h0_min << ", Max: " << h0_max << "\n";
+  }
+
+  // Save h0_embedding before any layer processing
+  std::vector<float> h0_embedding(ws->h0, ws->h0 + B * S * cfg.hidden);
+  g_h0_embedding = h0_embedding;  // Save to global for later use in main()
+
+  // Also save to file in forward pass for comparison
+  {
+    static bool first_call = true;
+    if (first_call) {
+      first_call = false;
+      // This will be called only once
+      // We'll save it in main() instead
+    }
+  }
+
   // 1) layer stack
   for (int64_t l = 0; l < cfg.n_layers; ++l) {
+    // For layer 0, save intermediate outputs
+    if (l == 0) {
+      // Apply input_layernorm
+      rms_norm_lastdim(ws->h0, B * S, cfg.hidden, w.layers[l].rms_attn,
+                       cfg.hidden, cfg.rms_eps, ws->h1);
+      g_h_norm_l0.assign(ws->h1, ws->h1 + B * S * cfg.hidden);
+      std::cout << "[DEBUG] Saved h_norm (after input_layernorm) for layer 0\n";
+    }
+
     // attention
     minimind_attention_forward_infer(cfg, w.layers[l], w.rope_cos, w.rope_sin,
                                      cfg.max_pos, attention_mask_bt, m1, m0,
                                      cache, static_cast<int>(l), ws->h0, B, S,
                                      cfg.hidden, ws, ws->h1);
+    // For layer 0, save attention output
+    if (l == 0) {
+      g_h1_attn_l0.assign(ws->h1, ws->h1 + B * S * cfg.hidden);
+      std::cout << "[DEBUG] Saved h1 (after attention) for layer 0\n";
+    }
 
     // ffn (dense; moe 你可以在这里替换成 moe 版本)
     minimind_ffn_forward_infer(cfg, w.layers[l], ws->h1, B, S, cfg.hidden, ws,
                                ws->h0);
+
+    // For layer 0, save FFN output
+    if (l == 0) {
+      g_h0_ffn_l0.assign(ws->h0, ws->h0 + B * S * cfg.hidden);
+      std::cout << "[DEBUG] Saved h0 (after FFN) for layer 0\n";
+    }
   }
 
   // 2) final norm: h1 = rms_norm(h0)
@@ -364,6 +494,7 @@ inline void minimind_forward_infer(const minimind_config& cfg,
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -373,52 +504,10 @@ inline void minimind_forward_infer(const minimind_config& cfg,
 #include <string>
 #include <vector>
 
-// #include "tensor_ops_5d.h"
-// #include "minimind_forward_5d.h"
+#include "tensor_op.hpp"
+#include "third_party/nlohmann/json.hpp"
 
-static bool read_file(const std::string& path, std::vector<uint8_t>* out) {
-  std::ifstream ifs(path, std::ios::binary);
-  if (!ifs) return false;
-  ifs.seekg(0, std::ios::end);
-  const std::streamsize n = ifs.tellg();
-  ifs.seekg(0, std::ios::beg);
-  out->assign(static_cast<size_t>(n), 0);
-  if (!ifs.read(reinterpret_cast<char*>(out->data()), n)) return false;
-  return true;
-}
-
-static bool read_f32(const std::string& path, std::vector<float>* out,
-                     size_t expect_elems) {
-  std::vector<uint8_t> buf;
-  if (!read_file(path, &buf)) return false;
-  if (buf.size() != expect_elems * sizeof(float)) {
-    std::cerr << "Size mismatch: " << path << " bytes=" << buf.size()
-              << " expect=" << (expect_elems * sizeof(float)) << "\n";
-    return false;
-  }
-  out->resize(expect_elems);
-  std::memcpy(out->data(), buf.data(), buf.size());
-  return true;
-}
-
-static bool read_i32(const std::string& path, std::vector<int32_t>* out,
-                     size_t expect_elems) {
-  std::vector<uint8_t> buf;
-  if (!read_file(path, &buf)) return false;
-  if (buf.size() != expect_elems * sizeof(int32_t)) return false;
-  out->resize(expect_elems);
-  std::memcpy(out->data(), buf.data(), buf.size());
-  return true;
-}
-
-static bool read_u8(const std::string& path, std::vector<uint8_t>* out,
-                    size_t expect_elems) {
-  std::vector<uint8_t> buf;
-  if (!read_file(path, &buf)) return false;
-  if (buf.size() != expect_elems * sizeof(uint8_t)) return false;
-  *out = std::move(buf);
-  return true;
-}
+using json = nlohmann::json;
 
 static void write_f32(const std::string& path, const float* x, size_t n) {
   std::ofstream ofs(path, std::ios::binary);
@@ -426,108 +515,148 @@ static void write_f32(const std::string& path, const float* x, size_t n) {
             static_cast<std::streamsize>(n * sizeof(float)));
 }
 
+// ===== JSON 辅助函数 =====
+static inline int b64_char_to_val(unsigned char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;  // padding or invalid
+}
+
+static std::vector<uint8_t> b64_decode(const std::string& b64) {
+  std::vector<uint8_t> ret;
+  int val = 0;
+  int bits = 0;
+
+  for (unsigned char c : b64) {
+    int digit = b64_char_to_val(c);
+    if (digit == -1) continue;  // skip invalid chars (including padding)
+
+    val = (val << 6) | digit;
+    bits += 6;
+
+    if (bits >= 8) {
+      bits -= 8;
+      ret.push_back((val >> bits) & 0xFF);
+    }
+  }
+
+  return ret;
+}
+
+static std::vector<float> load_tensor_from_json(const json& j) {
+  std::string b64_data = j["data"];
+  std::vector<uint8_t> decoded = b64_decode(b64_data);
+  // 确保大小是float大小的倍数
+  if (decoded.size() % sizeof(float) != 0) {
+    std::cerr << "[ERROR] Decoded data size " << decoded.size()
+              << " is not a multiple of sizeof(float)=" << sizeof(float)
+              << "\n";
+  }
+  std::vector<float> result(decoded.size() / sizeof(float));
+  std::memcpy(result.data(), decoded.data(), decoded.size());
+  return result;
+}
+
 int main(int argc, char** argv) {
-  const std::string dump_dir = (argc >= 2) ? argv[1] : "dump_minimind";
+  std::string json_path = (argc >= 2) ? argv[1] : "dump_minimind/minimind.json";
+  std::string dump_dir = (argc >= 3) ? argv[2] : "dump_minimind";
 
-  // ===== 读取 meta.txt 手动对齐（这里直接 hardcode，和 Python 默认一致）=====
-  // 你如果改了 Python 的环境变量，就把这里跟着改。
-  const int64_t B = 2;
-  const int64_t S = 5;
-  const int64_t vocab = 128;
-  const int64_t hidden = 64;
-  const int64_t layers = 2;
-  const int64_t heads = 8;
-  const int64_t kv_heads = 2;
+  // Store dump_dir in global for use in forward function
+  g_dump_dir = dump_dir;
+
+  // ===== 加载 JSON =====
+  std::ifstream json_file(json_path);
+  if (!json_file.is_open()) {
+    std::cerr << "Failed to open JSON: " << json_path << "\n";
+    return 1;
+  }
+  json j;
+  json_file >> j;
+  json_file.close();
+
+  std::cout << "[OK] Loaded JSON from: " << json_path << "\n";
+
+  // 解析 config
+  auto cfg_j = j["config"];
+  const int64_t vocab = cfg_j["vocab_size"];
+  const int64_t hidden = cfg_j["hidden_size"];
+  const int64_t layers = cfg_j["num_hidden_layers"];
+  const int64_t heads = cfg_j["num_attention_heads"];
+  const int64_t kv_heads = cfg_j["num_key_value_heads"];
+  const int64_t inter = cfg_j["intermediate_size"];
+  const int64_t max_pos = cfg_j["max_position_embeddings"];
   const int64_t head_dim = hidden / heads;
-  const int64_t inter =
-      192;  // Python 自动算出来的 intermediate_size（注意：换 hidden 会变）
-  const int64_t max_pos = 128;
 
-  // ===== 读输入 =====
-  std::vector<int32_t> input_ids;
-  std::vector<uint8_t> attn_mask;
-  if (!read_i32(dump_dir + "/input_ids_i32.bin", &input_ids,
-                static_cast<size_t>(B * S))) {
-    std::cerr << "Failed to read input_ids\n";
-    return 1;
-  }
-  if (!read_u8(dump_dir + "/attn_mask_u8.bin", &attn_mask,
-               static_cast<size_t>(B * S))) {
-    std::cerr << "Failed to read attn_mask\n";
-    return 1;
-  }
+  // 解析 meta
+  auto meta = j["meta"];
+  const int64_t B = meta["B"];
+  const int64_t S = meta["S"];
 
-  // ===== 读 rope cos/sin =====
-  std::vector<float> rope_cos, rope_sin;
-  if (!read_f32(dump_dir + "/rope_cos_f32.bin", &rope_cos,
-                static_cast<size_t>(max_pos * head_dim))) {
-    std::cerr << "Failed to read rope_cos\n";
-    return 1;
-  }
-  if (!read_f32(dump_dir + "/rope_sin_f32.bin", &rope_sin,
-                static_cast<size_t>(max_pos * head_dim))) {
-    std::cerr << "Failed to read rope_sin\n";
-    return 1;
-  }
+  std::cout << "Config: hidden=" << hidden << " layers=" << layers
+            << " heads=" << heads << " vocab=" << vocab << "\n";
+  std::cout << "Input: B=" << B << " S=" << S << "\n";
 
-  // ===== 读 embedding / final norm / lm_head =====
-  std::vector<float> tok_embedding, final_rms, lm_head;
-  if (!read_f32(dump_dir + "/tok_embedding_f32.bin", &tok_embedding,
-                static_cast<size_t>(vocab * hidden))) {
-    std::cerr << "Failed tok_embedding\n";
-    return 1;
-  }
-  if (!read_f32(dump_dir + "/final_rms_f32.bin", &final_rms,
-                static_cast<size_t>(hidden))) {
-    std::cerr << "Failed final_rms\n";
-    return 1;
-  }
-  if (!read_f32(dump_dir + "/lm_head_f32.bin", &lm_head,
-                static_cast<size_t>(vocab * hidden))) {
-    std::cerr << "Failed lm_head\n";
-    return 1;
+  // 加载 inputs
+  // input_ids是int32，需要直接解码
+  std::string input_ids_b64 = j["inputs"]["input_ids"]["data"];
+  std::vector<uint8_t> input_ids_bytes = b64_decode(input_ids_b64);
+  std::vector<int32_t> input_ids(input_ids_bytes.size() / sizeof(int32_t));
+  std::memcpy(input_ids.data(), input_ids_bytes.data(), input_ids_bytes.size());
+
+  // attn_mask是uint8，需要直接解码
+  std::string attn_mask_b64 = j["inputs"]["attention_mask"]["data"];
+  std::vector<uint8_t> attn_mask_bytes = b64_decode(attn_mask_b64);
+  std::vector<uint8_t> attn_mask = attn_mask_bytes;
+
+  // 加载 rope
+  std::vector<float> rope_cos = load_tensor_from_json(j["rope"]["cos"]);
+  std::vector<float> rope_sin = load_tensor_from_json(j["rope"]["sin"]);
+
+  // 加载 weights
+  std::vector<float> tok_embedding =
+      load_tensor_from_json(j["weights"]["tok_embedding"]);
+  std::vector<float> final_rms =
+      load_tensor_from_json(j["weights"]["final_rms"]);
+  std::vector<float> lm_head = load_tensor_from_json(j["weights"]["lm_head"]);
+
+  // Debug: Save tok_embedding for comparison
+  {
+    std::string emb_path = dump_dir + "/tok_embedding_cpp.npy";
+    write_f32(emb_path, tok_embedding.data(), tok_embedding.size());
+    std::cout << "[DEBUG] Saved tok_embedding to: " << emb_path << "\n";
+    std::cout << "[DEBUG] tok_embedding size: " << tok_embedding.size()
+              << ", min: "
+              << *std::min_element(tok_embedding.begin(), tok_embedding.end())
+              << ", max: "
+              << *std::max_element(tok_embedding.begin(), tok_embedding.end())
+              << "\n";
   }
 
-  // ===== 读每层权重 =====
+  // 加载 layers
   std::vector<minimind_layer_weights> layer_w(static_cast<size_t>(layers));
-  // 每个 weight 实际数据放这里（vector 不能被 move 后地址变）
-  std::vector<std::vector<float> > wq(layers), wk(layers), wv(layers),
+  std::vector<std::vector<float>> wq(layers), wk(layers), wv(layers),
       wo(layers);
-  std::vector<std::vector<float> > wgate(layers), wup(layers), wdown(layers);
-  std::vector<std::vector<float> > rms_attn(layers), rms_ffn(layers);
+  std::vector<std::vector<float>> wgate(layers), wup(layers), wdown(layers);
+  std::vector<std::vector<float>> rms_attn(layers), rms_ffn(layers);
 
+  auto layers_j = j["weights"]["layers"];
   for (int64_t l = 0; l < layers; ++l) {
-    auto L = std::to_string(l);
+    auto layer_j = layers_j[l];
 
-    if (!read_f32(dump_dir + "/layer" + L + "_rms_attn.bin", &rms_attn[l],
-                  hidden))
-      return 1;
-    if (!read_f32(dump_dir + "/layer" + L + "_rms_ffn.bin", &rms_ffn[l],
-                  hidden))
-      return 1;
+    rms_attn[l] = load_tensor_from_json(layer_j["rms_attn"]);
+    rms_ffn[l] = load_tensor_from_json(layer_j["rms_ffn"]);
 
-    if (!read_f32(dump_dir + "/layer" + L + "_wq.bin", &wq[l],
-                  static_cast<size_t>(heads * head_dim * hidden)))
-      return 1;
-    if (!read_f32(dump_dir + "/layer" + L + "_wk.bin", &wk[l],
-                  static_cast<size_t>(kv_heads * head_dim * hidden)))
-      return 1;
-    if (!read_f32(dump_dir + "/layer" + L + "_wv.bin", &wv[l],
-                  static_cast<size_t>(kv_heads * head_dim * hidden)))
-      return 1;
-    if (!read_f32(dump_dir + "/layer" + L + "_wo.bin", &wo[l],
-                  static_cast<size_t>(hidden * (heads * head_dim))))
-      return 1;
+    wq[l] = load_tensor_from_json(layer_j["wq"]);
+    wk[l] = load_tensor_from_json(layer_j["wk"]);
+    wv[l] = load_tensor_from_json(layer_j["wv"]);
+    wo[l] = load_tensor_from_json(layer_j["wo"]);
 
-    if (!read_f32(dump_dir + "/layer" + L + "_w_gate.bin", &wgate[l],
-                  static_cast<size_t>(inter * hidden)))
-      return 1;
-    if (!read_f32(dump_dir + "/layer" + L + "_w_up.bin", &wup[l],
-                  static_cast<size_t>(inter * hidden)))
-      return 1;
-    if (!read_f32(dump_dir + "/layer" + L + "_w_down.bin", &wdown[l],
-                  static_cast<size_t>(hidden * inter)))
-      return 1;
+    wgate[l] = load_tensor_from_json(layer_j["w_gate"]);
+    wup[l] = load_tensor_from_json(layer_j["w_up"]);
+    wdown[l] = load_tensor_from_json(layer_j["w_down"]);
 
     layer_w[l].rms_attn = rms_attn[l].data();
     layer_w[l].rms_ffn = rms_ffn[l].data();
@@ -540,9 +669,9 @@ int main(int argc, char** argv) {
     layer_w[l].w_gate = wgate[l].data();
     layer_w[l].w_up = wup[l].data();
     layer_w[l].w_down = wdown[l].data();
-
-    // 本次测试 bias 都是 nullptr（Python 里 bias=False）
   }
+
+  std::cout << "[OK] Loaded all weights from JSON\n";
 
   // ===== 组 config & weights =====
   minimind_config cfg;
@@ -616,35 +745,120 @@ int main(int argc, char** argv) {
   ws.ffn_out = ffn_out.data();
   ws.logits = logits.data();
 
-  // ===== 运行 forward =====
-  // attention_mask_bt: (B,T) 这里 T=S
-  kv_cache* cache = nullptr;  // 本次先不测 cache
+  // ===== 运行 forward (timed) =====
+  kv_cache* cache = nullptr;
 
+  auto start = std::chrono::high_resolution_clock::now();
   minimind_forward_infer(cfg, W, input_ids.data(), B, S, attn_mask.data(), B, T,
                          cache, &ws, logits.data(), B, S, vocab);
+  auto end = std::chrono::high_resolution_clock::now();
+  auto elapsed_ms =
+      std::chrono::duration<double, std::milli>(end - start).count();
 
-  // ===== 写 cpp logits =====
-  write_f32(dump_dir + "/cpp_logits_f32.bin", logits.data(),
-            static_cast<size_t>(B * S * vocab));
-  std::cout << "[OK] wrote " << (dump_dir + "/cpp_logits_f32.bin") << "\n";
+  std::cout << "\n========================================\n";
+  std::cout << "[Forward] Shape: (" << B << ", " << S << ", " << vocab << ")"
+            << "\n";
+  std::cout << "[Timing] Forward pass: " << elapsed_ms << "ms\n";
 
-  // ===== 读 python logits 并算 diff =====
-  std::vector<float> py_logits;
-  if (read_f32(dump_dir + "/py_logits_f32.bin", &py_logits,
-               static_cast<size_t>(B * S * vocab))) {
-    double max_abs = 0.0;
-    double mean_abs = 0.0;
-    for (size_t i = 0; i < py_logits.size(); ++i) {
-      const double d = std::abs(static_cast<double>(py_logits[i]) -
-                                static_cast<double>(logits[i]));
-      max_abs = std::max(max_abs, d);
-      mean_abs += d;
-    }
-    mean_abs /= static_cast<double>(py_logits.size());
-    std::cout << "diff: max_abs=" << max_abs << " mean_abs=" << mean_abs
+  // 计算 logits 统计
+  float min_logit = logits[0];
+  float max_logit = logits[0];
+  double mean_logit = 0.0;
+  for (const auto& val : logits) {
+    min_logit = std::min(min_logit, val);
+    max_logit = std::max(max_logit, val);
+    mean_logit += val;
+  }
+  mean_logit /= logits.size();
+
+  std::cout << "[Logits] Min: " << min_logit << ", Max: " << max_logit
+            << ", Mean: " << mean_logit << "\n";
+  std::cout << "========================================\n\n";
+
+  // ===== 保存 logits =====
+  std::string logits_path = dump_dir + "/logits_cpp.npy";
+  // 简单保存为binary（numpy可以读，或者用 Python 处理）
+  write_f32(logits_path, logits.data(), logits.size());
+  std::cout << "[OK] Saved logits to: " << logits_path << "\n";
+
+  // 保存embedding输出以便调试（这是从minimind_forward_infer中保存的h0_embedding）
+  if (!g_h0_embedding.empty()) {
+    std::string h0_path = dump_dir + "/h0_cpp.npy";
+    write_f32(h0_path, g_h0_embedding.data(), g_h0_embedding.size());
+    std::cout << "[DEBUG] Saved h0 (embedding output) to: " << h0_path << "\n";
+  }
+
+  // Save layer 0 intermediate outputs for debugging
+  if (!g_h_norm_l0.empty()) {
+    std::string path = dump_dir + "/h_norm_l0_cpp.npy";
+    write_f32(path, g_h_norm_l0.data(), g_h_norm_l0.size());
+    std::cout << "[DEBUG] Saved h_norm_l0 (after input_layernorm) to: " << path
               << "\n";
-  } else {
-    std::cout << "py_logits_f32.bin not found, skip diff.\n";
+  }
+  if (!g_h1_attn_l0.empty()) {
+    std::string path = dump_dir + "/h1_attn_l0_cpp.npy";
+    write_f32(path, g_h1_attn_l0.data(), g_h1_attn_l0.size());
+    std::cout << "[DEBUG] Saved h1_attn_l0 (after attention) to: " << path
+              << "\n";
+  }
+  if (!g_h0_ffn_l0.empty()) {
+    std::string path = dump_dir + "/h0_ffn_l0_cpp.npy";
+    write_f32(path, g_h0_ffn_l0.data(), g_h0_ffn_l0.size());
+    std::cout << "[DEBUG] Saved h0_ffn_l0 (after FFN) to: " << path << "\n";
+  }
+
+  // Save attention intermediates for layer 0
+  if (!g_q_flat_l0.empty()) {
+    std::string path = dump_dir + "/q_flat_l0_cpp.npy";
+    write_f32(path, g_q_flat_l0.data(), g_q_flat_l0.size());
+    std::cout << "[DEBUG] Saved q_flat_l0 (Q projections) to: " << path << "\n";
+  }
+  if (!g_k_flat_l0.empty()) {
+    std::string path = dump_dir + "/k_flat_l0_cpp.npy";
+    write_f32(path, g_k_flat_l0.data(), g_k_flat_l0.size());
+    std::cout << "[DEBUG] Saved k_flat_l0 (K projections) to: " << path << "\n";
+  }
+  if (!g_v_flat_l0.empty()) {
+    std::string path = dump_dir + "/v_flat_l0_cpp.npy";
+    write_f32(path, g_v_flat_l0.data(), g_v_flat_l0.size());
+    std::cout << "[DEBUG] Saved v_flat_l0 (V projections) to: " << path << "\n";
+  }
+  if (!g_scores_l0.empty()) {
+    std::string path = dump_dir + "/scores_l0_cpp.npy";
+    write_f32(path, g_scores_l0.data(), g_scores_l0.size());
+    std::cout << "[DEBUG] Saved scores_l0 (attention scores) to: " << path
+              << "\n";
+  }
+  if (!g_probs_l0.empty()) {
+    std::string path = dump_dir + "/probs_l0_cpp.npy";
+    write_f32(path, g_probs_l0.data(), g_probs_l0.size());
+    std::cout << "[DEBUG] Saved probs_l0 (attention probs) to: " << path
+              << "\n";
+  }
+  if (!g_attn_out_flat_l0.empty()) {
+    std::string path = dump_dir + "/attn_out_flat_l0_cpp.npy";
+    write_f32(path, g_attn_out_flat_l0.data(), g_attn_out_flat_l0.size());
+    std::cout << "[DEBUG] Saved attn_out_flat_l0 (merged attn heads) to: "
+              << path << "\n";
+  }
+  if (!g_attn_proj_l0.empty()) {
+    std::string path = dump_dir + "/attn_proj_l0_cpp.npy";
+    write_f32(path, g_attn_proj_l0.data(), g_attn_proj_l0.size());
+    std::cout << "[DEBUG] Saved attn_proj_l0 (after w_o + bias) to: " << path
+              << "\n";
+  }
+  if (!g_ffn_norm_l0.empty()) {
+    std::string path = dump_dir + "/ffn_norm_l0_cpp.npy";
+    write_f32(path, g_ffn_norm_l0.data(), g_ffn_norm_l0.size());
+    std::cout << "[DEBUG] Saved ffn_norm_l0 (after FFN RMSNorm) to: " << path
+              << "\n";
+  }
+  if (!g_ffn_out_l0.empty()) {
+    std::string path = dump_dir + "/ffn_out_l0_cpp.npy";
+    write_f32(path, g_ffn_out_l0.data(), g_ffn_out_l0.size());
+    std::cout << "[DEBUG] Saved ffn_out_l0 (after FFN down projection, before "
+                 "residual) to: "
+              << path << "\n";
   }
 
   return 0;
