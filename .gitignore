@@ -1,8 +1,43 @@
-cmake-build-debug
-cmake-build-release
-.idea
-build
+# Build artifacts
+build/
+cpp/build/
+*.o
+*.a
+*.so
+*.dylib
 
-__pycache__
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 
-dump_minimind
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.tox/
+venv/
+env/
+
+# Model outputs
+dump_minimind/
+data/output/
+*.npy
+*.bin
+
+# CMake
+cmake-build-debug/
+cmake-build-release/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride

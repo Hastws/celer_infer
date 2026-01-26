@@ -1,21 +1,66 @@
 # CelerInfer - AI Agent Instructions
 
 ## Project Overview
-CelerInfer is a hybrid C++/Python LLM inference framework that implements a "baseline micro" implementation of the MiniMind model. The project bridges PyTorch model training/verification with raw C++ tensor operations for inference optimization.
+CelerInfer is a **modular, multi-model hybrid C++/Python LLM inference framework**. Currently implements MiniMind baseline micro with support for extensible architecture. The project bridges PyTorch model training/verification with optimized C++ tensor operations for efficient inference.
 
-## Architecture Pattern
+## Project Structure (Post-Refactoring)
 
-### Core Workflow: Train → Dump → Verify → Infer
-1. **Python (PyTorch)**: Define model architecture in `llm_minimind_model.py` (inherits `PreTrainedModel`)
-2. **Dump to JSON**: `llm_minimind_dump.py` extracts weights from trained model → Base64-encoded JSON
-3. **Forward Verify**: `llm_minimind_forward.py` loads JSON, validates inference output against PyTorch
-4. **C++ Inference**: `base_line_micro.cpp` implements the actual inference loop with raw float pointers
+### Core Directories
+- **[python/](python/)** - Main Python implementation
+  - `core/` - Model definitions and interfaces
+  - `export/` - Weight dumping (PyTorch → JSON)
+  - `inference/` - Inference and verification
+  - `debug/` - Debugging and layer extraction
+  - `validate/` - Comparison and validation tools
+  - `__main__.py` - Unified CLI entry point
 
-### Key File Purposes
-- [cpp/tensor_op.hpp](cpp/tensor_op.hpp) - Header-only library: 2397 lines of tensor ops (matmul, attention, norm, etc.)
-- [cpp/base_line_micro.cpp](cpp/base_line_micro.cpp) - Main inference loop using tensor ops; defines `minimind_config` and layer weight structs
-- [script/llm_minimind_model.py](script/llm_minimind_model.py) - PyTorch model definition with MoE support, RoPE, attention mechanisms
-- [script/llm_minimind_dump.py](script/llm_minimind_dump.py) - Export weights to JSON with Base64 encoding
+- **[cpp/](cpp/)** - C++ inference engine
+  - `src/models/` - Model implementations
+  - `src/ops/` - Tensor operations
+  - `include/` - Public headers
+  - `tensor_op.hpp` - Header-only tensor lib
+
+- **[models/](models/)** - Model configs and weights
+  - `minimind/` - MiniMind config.json + weights
+  - `llama/` - Placeholder for future models
+
+- **[scripts/](scripts/)** - Convenience shell scripts
+  - `build_cpp.sh` - Compile C++
+  - `run_validation.sh` - Full validation pipeline
+  - `clean.sh` - Clean artifacts
+
+- **[docs/](docs/)** - Documentation
+  - `ARCHITECTURE.md` - Detailed architecture guide
+  - `MODELS.md` - Supported models list
+
+## Unified CLI Interface
+
+```bash
+# List models
+python -m python list-models
+
+# Dump weights
+python -m python dump --model minimind
+
+# Validate consistency
+python -m python validate --model minimind
+
+# Debug (layer extraction, etc.)
+python -m python debug --model minimind [--layer N]
+```
+
+## Core Workflow: Train → Dump → Verify → Infer
+1. **Python (PyTorch)**: `python/core/minimind_model.py` - Model definition
+2. **Dump to JSON**: `python/export/minimind_dumper.py` - Weights → Base64 JSON
+3. **Forward Verify**: `python/inference/minimind_forward.py` - Verify against PyTorch
+4. **C++ Inference**: `cpp/src/models/minimind.cpp` - Optimized C++ inference
+
+### Key File Purposes (Updated Locations)
+- [cpp/src/ops/tensor_ops.hpp](cpp/src/ops/tensor_ops.hpp) - Header-only tensor ops library
+- [cpp/src/models/minimind.cpp](cpp/src/models/minimind.cpp) - MiniMind inference
+- [python/core/minimind_model.py](python/core/minimind_model.py) - PyTorch MiniMind
+- [python/export/minimind_dumper.py](python/export/minimind_dumper.py) - Weight export
+- [models/minimind/config.json](models/minimind/config.json) - Model configuration
 
 ## Critical Design Conventions
 
@@ -48,27 +93,25 @@ Model weights stored in JSON with Base64 encoding:
 
 ## Developer Workflows
 
-### Build C++ Code
+### Using Unified CLI
 ```bash
-cd cpp
-mkdir -p build && cd build
-cmake .. && make
-./base_line_micro
-```
+# List available models
+python -m python list-models
 
-### Dump Model Weights
-```bash
-cd script
-python llm_minimind_dump.py
-# Output: dump_minimind/minimind.json
-```
+# Build C++ (from scripts)
+bash scripts/build_cpp.sh
 
-### Verify Against PyTorch
-```bash
-export JSON_PATH=dump_minimind/minimind.json
-export DUMP_DIR=./outputs
-export WARMUP=10
-python llm_minimind_forward.py
+# Dump model weights
+python -m python dump --model minimind
+
+# Validate consistency
+python -m python validate --model minimind
+
+# Run debugging
+python -m python debug --model minimind --layer 0
+
+# One-click full validation
+bash scripts/run_validation.sh minimind
 ```
 
 ### Environment
@@ -76,6 +119,17 @@ python llm_minimind_forward.py
 - Conda environment: `conda create -n CelerInfer python=3.12.11`
 - C++14 standard (CMakeLists.txt)
 - Dependencies: torch, transformers, numpy, nlohmann/json (third_party/)
+
+## Adding New Models
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#adding-a-new-model) for detailed instructions:
+
+1. Create `models/mymodel/config.json`
+2. Implement Python model in `python/core/mymodel_model.py`
+3. Implement dumper in `python/export/mymodel_dumper.py`
+4. Implement verifier in `python/inference/mymodel_forward.py`
+5. Register in `python/core/__init__.py`
+6. Implement C++ version in `cpp/src/models/mymodel.cpp`
 
 ## Model Features
 
