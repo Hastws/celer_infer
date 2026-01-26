@@ -193,6 +193,23 @@ def main(skip_comparison: bool = False) -> None:
     np.save(logits_path, logits)
     print("[OK] Saved logits to: {}".format(logits_path))
 
+    # Save timing info to JSON for benchmark comparison
+    B, S, V = logits.shape
+    timing_info = {
+        "platform": "pytorch",
+        "elapsed_ms": elapsed * 1000,
+        "batch_size": int(B),
+        "seq_len": int(S),
+        "vocab_size": int(V),
+        "warmup": warmup,
+        "elements": int(B * S * V),
+        "throughput_elem_per_sec": int(B * S * V) / elapsed if elapsed > 0 else 0,
+    }
+    timing_path = os.path.join(dump_dir, "timing_torch.json")
+    with open(timing_path, "w") as f:
+        json.dump(timing_info, f, indent=2)
+    print("[OK] Saved timing to: {}".format(timing_path))
+
     # Save embedding output for debugging
     print("\n[DEBUG] Extracting embedding output for comparison...")
     with torch.no_grad():

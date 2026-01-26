@@ -88,6 +88,14 @@ def build_cpp(project_root: str) -> bool:
     return True
 
 
+@dataclass
+class TimingResult:
+    """计时结果"""
+    torch_ms: float = 0.0
+    cpp_ms: float = 0.0
+    speedup: float = 0.0  # torch_ms / cpp_ms
+
+
 def run_single_test(
     test_case: TestCase,
     project_root: str,
@@ -95,12 +103,12 @@ def run_single_test(
     atol: float,
     rtol: float,
     verbose: bool = False
-) -> Tuple[bool, float, str]:
+) -> Tuple[bool, float, str, Optional[TimingResult]]:
     """
     运行单个测试用例
     
     Returns:
-        (passed, max_diff, message)
+        (passed, max_diff, message, timing)
     """
     # 设置环境变量
     os.environ['DUMP_DIR'] = dump_dir
@@ -155,14 +163,36 @@ def run_single_test(
     
     is_close = np.allclose(logits_torch, logits_cpp, rtol=rtol, atol=atol)
     
+    # 收集计时信息
+    timing = None
+    try:
+        import json as json_module
+        timing_torch_path = os.path.join(dump_dir, 'timing_torch.json')
+        if os.path.exists(timing_torch_path):
+            with open(timing_torch_path) as f:
+                torch_timing = json_module.load(f)
+            torch_ms = torch_timing.get('elapsed_ms', 0)
+            
+            # 从C++输出解析计时
+            cpp_ms = 0.0
+            import re
+            match = re.search(r'Forward pass: ([\d.]+)ms', out)
+            if match:
+                cpp_ms = float(match.group(1))
+            
+            speedup = torch_ms / cpp_ms if cpp_ms > 0 else 0
+            timing = TimingResult(torch_ms=torch_ms, cpp_ms=cpp_ms, speedup=speedup)
+    except Exception:
+        pass
+    
     if is_close:
         msg = f"max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}"
-        return True, max_diff, msg
+        return True, max_diff, msg, timing
     else:
         close_mask = np.isclose(logits_torch, logits_cpp, rtol=rtol, atol=atol)
         inconsistent_ratio = (1 - close_mask.mean()) * 100
         msg = f"max_diff={max_diff:.2e}, {inconsistent_ratio:.1f}%不一致"
-        return False, max_diff, msg
+        return False, max_diff, msg, timing
 
 
 def main():
@@ -204,54 +234,106 @@ def main():
     print(f'[测试] 运行 {len(cases_to_run)} 个测试用例...')
     print()
     
-    results: List[Tuple[str, bool, float, str]] = []
+    results: List[Tuple[str, bool, float, str, Optional[TimingResult]]] = []
     
     for i, tc in enumerate(cases_to_run, 1):
         print(f'[{i}/{len(cases_to_run)}] {tc.name}: {tc.description}')
         print(f'      参数: B={tc.B}, S={tc.S}, seed={tc.seed}')
         
-        passed, max_diff, msg = run_single_test(
+        passed, max_diff, msg, timing = run_single_test(
             tc, project_root, dump_dir,
             args.atol, args.rtol, args.verbose
         )
         
         status = '✅ 通过' if passed else '❌ 失败'
-        print(f'      结果: {status} ({msg})')
+        timing_str = ''
+        if timing:
+            timing_str = f' | PyTorch: {timing.torch_ms:.2f}ms, C++: {timing.cpp_ms:.2f}ms'
+            if timing.speedup > 0:
+                timing_str += f' ({timing.speedup:.1f}x)'
+        print(f'      结果: {status} ({msg}){timing_str}')
         print()
         
-        results.append((tc.name, passed, max_diff, msg))
+        results.append((tc.name, passed, max_diff, msg, timing))
     
     # 汇总结果
-    print('=' * 70)
+    print('=' * 90)
     print('测试结果汇总')
-    print('=' * 70)
+    print('=' * 90)
     print()
-    print(f'{"测试用例":<12} {"状态":<8} {"最大误差":<15} {"详情"}')
-    print('-' * 70)
+    print(f'{"测试用例":<12} {"状态":<8} {"最大误差":<12} {"PyTorch(ms)":<12} {"C++(ms)":<12} {"加速比"}')
+    print('-' * 90)
     
     passed_count = 0
-    for name, passed, max_diff, msg in results:
+    total_torch_ms = 0.0
+    total_cpp_ms = 0.0
+    timing_count = 0
+    
+    for name, passed, max_diff, msg, timing in results:
         status = '✅ 通过' if passed else '❌ 失败'
         diff_str = f'{max_diff:.2e}' if max_diff != float('inf') else 'N/A'
-        print(f'{name:<12} {status:<8} {diff_str:<15} {msg}')
+        
+        if timing:
+            torch_str = f'{timing.torch_ms:.2f}'
+            cpp_str = f'{timing.cpp_ms:.2f}'
+            speedup_str = f'{timing.speedup:.2f}x' if timing.speedup > 0 else 'N/A'
+            total_torch_ms += timing.torch_ms
+            total_cpp_ms += timing.cpp_ms
+            timing_count += 1
+        else:
+            torch_str = cpp_str = speedup_str = 'N/A'
+            
+        print(f'{name:<12} {status:<8} {diff_str:<12} {torch_str:<12} {cpp_str:<12} {speedup_str}')
         if passed:
             passed_count += 1
     
-    print('-' * 70)
+    print('-' * 90)
     print(f'总计: {passed_count}/{len(results)} 通过')
+    
+    # 显示计时汇总
+    if timing_count > 0:
+        avg_speedup = total_torch_ms / total_cpp_ms if total_cpp_ms > 0 else 0
+        print()
+        print('=' * 90)
+        print('性能对比汇总')
+        print('=' * 90)
+        print(f'  PyTorch 总耗时: {total_torch_ms:.2f}ms')
+        print(f'  C++     总耗时: {total_cpp_ms:.2f}ms')
+        print(f'  平均加速比:     {avg_speedup:.2f}x')
+        
+        # 按元素数量排序显示性能趋势
+        print()
+        print('性能趋势 (按输入大小排序):')
+        sorted_results = []
+        for name, passed, max_diff, msg, timing in results:
+            tc = TEST_CASES.get(name)
+            if tc and timing:
+                elements = tc.B * tc.S
+                sorted_results.append((elements, tc.B, tc.S, name, timing))
+        
+        sorted_results.sort(key=lambda x: x[0])
+        print(f'  {"B*S":<8} {"B":<4} {"S":<4} {"用例":<10} {"PyTorch":<10} {"C++":<10} {"加速比"}')
+        for elements, b, s, name, timing in sorted_results:
+            speedup_str = f'{timing.speedup:.2f}x' if timing.speedup > 0 else 'N/A'
+            indicator = '🚀' if timing.speedup > 1.5 else ('⚠️' if timing.speedup < 0.5 else '  ')
+            print(f'  {elements:<8} {b:<4} {s:<4} {name:<10} {timing.torch_ms:.2f}ms     {timing.cpp_ms:.2f}ms     {speedup_str} {indicator}')
+        
+        print()
+        print('  🚀 = C++ 显著更快 (>1.5x)  ⚠️ = C++ 显著更慢 (<0.5x)')
+        print('=' * 90)
     print()
     
     if passed_count == len(results):
-        print('=' * 70)
+        print('=' * 90)
         print('✅ 所有测试用例通过!')
         print(f'   阈值: atol={args.atol}, rtol={args.rtol}')
-        print('=' * 70)
+        print('=' * 90)
         return 0
     else:
         failed_count = len(results) - passed_count
-        print('=' * 70)
+        print('=' * 90)
         print(f'❌ {failed_count} 个测试用例失败')
-        print('=' * 70)
+        print('=' * 90)
         return 1
 
 
