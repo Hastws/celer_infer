@@ -284,31 +284,21 @@ inline void minimind_attention_forward_infer(
                          D);
 
   // merge heads copy (B,S,H,D)->(B,S,H*D)
-  for (int64_t b = 0; b < B; ++b) {
-    for (int64_t s = 0; s < S; ++s) {
-        const float* src = ws->attn_out_bshd + off_4d_bshd(b, s, 0, 0, S, H, D);
-    }
-  }
-
-  // Save merged attention output for layer 0
-  // Debug buffer saving removed
+  // attn_out_bshd 已经是连续的 (B,S,H,D)，等价于 (B,S,H*D)
+  // 直接复制到 attn_out_flat
+  std::memcpy(ws->attn_out_flat, ws->attn_out_bshd,
+              static_cast<size_t>(B * S * H * D) * sizeof(float));
 
   // 14) o_proj: (B,S,H*D)->(B,S,hidden)
-  // Use ws->attn_out_bshd as temporary buffer for o_proj (no longer needed
-  // after merge_heads)
+  // 使用 ws->h1 作为临时buffer存储 o_proj 输出
   matmul_nt(ws->attn_out_flat, B * S, H * D, lw.w_o, HIDDEN, H * D,
-            (float*)ws->attn_out_bshd, B * S, HIDDEN);
+            ws->h1, B * S, HIDDEN);
   if (lw.b_o)
-    add_bias_lastdim_inplace((float*)ws->attn_out_bshd, B * S, HIDDEN, lw.b_o,
-                             HIDDEN);
-
-  // Save o_proj result for layer 0 (after bias, before residual)
-  // Debug buffer saving removed
+    add_bias_lastdim_inplace(ws->h1, B * S, HIDDEN, lw.b_o, HIDDEN);
 
   // 15) residual: out = x + o_proj
   std::memcpy(out, x, static_cast<size_t>(B * S * HIDDEN) * sizeof(float));
-  add_inplace(out, B * S * HIDDEN, (float*)ws->attn_out_bshd, B * S * HIDDEN,
-              1.0f);
+  add_inplace(out, B * S * HIDDEN, ws->h1, B * S * HIDDEN, 1.0f);
 }
 
 inline void minimind_ffn_forward_infer(const minimind_config& cfg,
@@ -369,67 +359,22 @@ inline void minimind_forward_infer(const minimind_config& cfg,
                                    int64_t o2, int64_t o1, int64_t o0) {
   // (B,S,V)
   assert(o2 == B && o1 == S && o0 == cfg.vocab_size);
-  // assert(cfg.hidden == w.layers[0].rms_attn ? cfg.hidden : cfg.hidden); //
-  // dummy "touch" to avoid unused warning
 
   // 0) embed -> ws->h0 (B,S,hidden)
   embedding_lookup_bsh(w.tok_embedding, cfg.vocab_size, cfg.hidden, input_ids,
                        B, S, ws->h0, B, S, cfg.hidden);
 
-  // Debug: Save h0 right after embedding for verification
-  {
-    std::cout << "[DEBUG] h0 after embedding lookup:\n";
-    std::cout << "  Shape: (" << B << ", " << S << ", " << cfg.hidden << ")\n";
-    std::cout << "  h0[0,0,:10] = ";
-    for (int i = 0; i < 10; ++i) {
-      std::cout << ws->h0[i] << " ";
-    }
-    std::cout << "\n";
-
-    // Find min/max
-    float h0_min = ws->h0[0], h0_max = ws->h0[0];
-    for (int64_t i = 0; i < B * S * cfg.hidden; ++i) {
-      h0_min = std::min(h0_min, ws->h0[i]);
-      h0_max = std::max(h0_max, ws->h0[i]);
-    }
-    std::cout << "  Min: " << h0_min << ", Max: " << h0_max << "\n";
-  }
-
-  // Save h0_embedding before any layer processing
-  // Skip global buffer saving to avoid destructor issues
-  // Just keep logits output which is the main result
-
   // 1) layer stack
   for (int64_t l = 0; l < cfg.n_layers; ++l) {
-    // For layer 0, save intermediate outputs
-    if (l == 0) {
-      // Apply input_layernorm
-      rms_norm_lastdim(ws->h0, B * S, cfg.hidden, w.layers[l].rms_attn,
-                       cfg.hidden, cfg.rms_eps, ws->h1);
-      // Debug buffer saving removed to avoid dtor issues
-      std::cout << "[DEBUG] Saved h_norm (after input_layernorm) for layer 0\n";
-    }
-
     // attention
     minimind_attention_forward_infer(cfg, w.layers[l], w.rope_cos, w.rope_sin,
                                      cfg.max_pos, attention_mask_bt, m1, m0,
                                      cache, static_cast<int>(l), ws->h0, B, S,
                                      cfg.hidden, ws, ws->h1);
-    // For layer 0, save attention output
-    if (l == 0) {
-      // Debug buffer saving removed
-      std::cout << "[DEBUG] Saved h1 (after attention) for layer 0\n";
-    }
 
     // ffn (dense; moe 你可以在这里替换成 moe 版本)
     minimind_ffn_forward_infer(cfg, w.layers[l], ws->h1, B, S, cfg.hidden, ws,
                                ws->h0);
-
-    // For layer 0, save FFN output
-    if (l == 0) {
-      // Debug buffer saving removed
-      std::cout << "[DEBUG] Saved h0 (after FFN) for layer 0\n";
-    }
   }
 
   // 2) final norm: h1 = rms_norm(h0)
@@ -575,19 +520,6 @@ int main(int argc, char** argv) {
       load_tensor_from_json(j["weights"]["final_rms"]);
   std::vector<float> lm_head = load_tensor_from_json(j["weights"]["lm_head"]);
 
-  // Debug: Save tok_embedding for comparison
-  {
-    std::string emb_path = dump_dir + "/tok_embedding_cpp.npy";
-    write_f32(emb_path, tok_embedding.data(), tok_embedding.size());
-    std::cout << "[DEBUG] Saved tok_embedding to: " << emb_path << "\n";
-    std::cout << "[DEBUG] tok_embedding size: " << tok_embedding.size()
-              << ", min: "
-              << *std::min_element(tok_embedding.begin(), tok_embedding.end())
-              << ", max: "
-              << *std::max_element(tok_embedding.begin(), tok_embedding.end())
-              << "\n";
-  }
-
   // 加载 layers
   std::vector<minimind_layer_weights> layer_w(static_cast<size_t>(layers));
   std::vector<std::vector<float>> wq(layers), wk(layers), wv(layers),
@@ -701,13 +633,6 @@ int main(int argc, char** argv) {
   ws.ffn_mid = ffn_mid_data;
   ws.ffn_out = ffn_out_data;
   ws.logits = logits_data;
-  
-  // Debug: verify pointers
-  std::cout << "[DEBUG] B=" << B << ", S=" << S << ", hidden=" << hidden << ", inter=" << inter << "\n";
-  std::cout << "[DEBUG] ffn_gate.size()=" << (B * S * inter) << ", data=" << (void*)ffn_gate_data << "\n";
-  std::cout << "[DEBUG] ws.h1=" << (void*)ws.h1 << "\n";
-  std::cout << "[DEBUG] ws.ffn_mid=" << (void*)ws.ffn_mid << "\n";
-  std::cout << "[DEBUG] ffn_mid.size()=" << (B * S * inter) << "\n";
 
   // ===== 运行 forward (timed) =====
   kv_cache* cache = nullptr;

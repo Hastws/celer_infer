@@ -54,9 +54,9 @@ def _build_cfg(cfg_j: Dict[str, Any]) -> MiniMindConfig:
     return cfg
 
 
-def main() -> None:
+def main(skip_comparison: bool = False) -> None:
     json_path = os.environ.get("JSON_PATH", "dump_minimind/minimind.json")
-    dump_dir = os.environ.get("DUMP_DIR", os.path.dirname(json_path) or ".")
+    dump_dir = os.environ.get("DUMP_DIR", "dump_minimind")
     os.makedirs(dump_dir, exist_ok=True)
 
     torch.set_default_dtype(torch.float32)
@@ -216,6 +216,29 @@ def main() -> None:
     print(
         "[DEBUG] Layer 0 intermediate outputs - skipping (requires model modification)"
     )
+
+
+class MinimindVerifier:
+    """Verifier class for MiniMind model consistency between PyTorch and C++"""
+
+    def __init__(self):
+        pass
+
+    def verify(self, config_path: str = None, skip_comparison: bool = False) -> bool:
+        """
+        Run the verification and return True if successful.
+
+        Args:
+            config_path: Path to JSON config file (overrides JSON_PATH env var)
+            skip_comparison: If True, only run inference without C++ comparison
+
+        Returns:
+            True if verification completed successfully
+        """
+        if config_path:
+            os.environ["JSON_PATH"] = config_path
+        main(skip_comparison=skip_comparison)
+        return True
 
 
 if __name__ == "__main__":

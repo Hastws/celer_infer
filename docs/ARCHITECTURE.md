@@ -90,9 +90,25 @@ PyTorch Model → llm_minimind_model.py → minimind_dumper.py → models/minimi
 
 ### Verification & Inference
 ```
-models/minimind/minimind.json → minimind_forward.py → PyTorch verification
-models/minimind/minimind.json → C++ engine → Output comparison
+dump_minimind/minimind.json → minimind_forward.py → logits_torch.npy
+dump_minimind/minimind.json → C++ engine        → logits_cpp.npy
+                          ↓
+              verify_consistency.py → 比较输出 → 报告误差
 ```
+
+### One-Click Verification (推荐)
+```bash
+python -m python.tools.verify_consistency
+```
+
+自动执行: 编译C++ → 导出权重 → PyTorch推理 → C++推理 → 比较输出
+
+**输出目录**: `dump_minimind/`
+| 文件 | 说明 |
+|------|------|
+| minimind.json | 模型权重 + 配置 (Base64编码) |
+| logits_torch.npy | PyTorch推理输出 |
+| logits_cpp.npy | C++推理输出 |
 
 ## Adding a New Model
 

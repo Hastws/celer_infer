@@ -59,6 +59,151 @@ def _fill_param(
         param.copy_(torch.from_numpy(arr))
 
 
+class MinimindDumper:
+    """Dumper class for MiniMind model weights export"""
+
+    def __init__(self):
+        pass
+
+    def dump(self, model: MiniMindForCausalLM, output_dir: str = "dump_minimind") -> str:
+        """
+        Dump MiniMind model weights to JSON.
+
+        Args:
+            model: MiniMindForCausalLM instance
+            output_dir: Output directory for dumped weights
+
+        Returns:
+            Path to the generated JSON file
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        out_json = os.path.join(output_dir, "minimind.json")
+
+        seed = 123
+        B = 2
+        S = 5
+        head_dim = model.config.hidden_size // model.config.num_attention_heads
+
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+        # Create dummy inputs
+        input_ids = torch.randint(0, model.config.vocab_size, (B, S), dtype=torch.long)
+        attn_mask = torch.ones((B, S), dtype=torch.uint8)
+
+        # Forward pass to get outputs
+        with torch.no_grad():
+            out = model(input_ids=input_ids, attention_mask=attn_mask)
+            logits = out.logits.detach().cpu().to(torch.float32).numpy()
+
+        # Build the JSON manifest
+        j = {
+            "meta": {
+                "seed": seed,
+                "B": B,
+                "S": S,
+                "head_dim": head_dim,
+            },
+            "config": _cfg_to_json_dict(model.config, model.config.intermediate_size),
+            "inputs": {
+                "input_ids": _encode_array(input_ids.numpy(), np.int32, "input_ids"),
+                "attention_mask": _encode_array(attn_mask.numpy(), np.uint8, "attention_mask"),
+            },
+            "weights": {
+                "tok_embedding": _encode_array(
+                    model.model.embed_tokens.weight.detach().cpu().numpy(),
+                    np.float32,
+                    "tok_embedding",
+                ),
+                "final_rms": _encode_array(
+                    model.model.norm.weight.detach().cpu().numpy(),
+                    np.float32,
+                    "final_rms",
+                ),
+                "lm_head": _encode_array(
+                    model.lm_head.weight.detach().cpu().numpy(),
+                    np.float32,
+                    "lm_head",
+                ),
+                "layers": [],
+            },
+            "rope": {
+                "cos": _encode_array(
+                    model.model.freqs_cos.cpu().numpy(),
+                    np.float32,
+                    "rope_cos",
+                ),
+                "sin": _encode_array(
+                    model.model.freqs_sin.cpu().numpy(),
+                    np.float32,
+                    "rope_sin",
+                ),
+            },
+        }
+
+        # Export per-layer weights
+        for l in range(model.config.num_hidden_layers):
+            blk = model.model.layers[l]
+            attn = blk.self_attn
+            mlp = blk.mlp
+
+            j["weights"]["layers"].append(
+                {
+                    "rms_attn": _encode_array(
+                        blk.input_layernorm.weight.detach().cpu().numpy(),
+                        np.float32,
+                        f"layer{l}_rms_attn",
+                    ),
+                    "rms_ffn": _encode_array(
+                        blk.post_attention_layernorm.weight.detach().cpu().numpy(),
+                        np.float32,
+                        f"layer{l}_rms_ffn",
+                    ),
+                    "wq": _encode_array(
+                        attn.q_proj.weight.detach().cpu().numpy(),
+                        np.float32,
+                        f"layer{l}_wq",
+                    ),
+                    "wk": _encode_array(
+                        attn.k_proj.weight.detach().cpu().numpy(),
+                        np.float32,
+                        f"layer{l}_wk",
+                    ),
+                    "wv": _encode_array(
+                        attn.v_proj.weight.detach().cpu().numpy(),
+                        np.float32,
+                        f"layer{l}_wv",
+                    ),
+                    "wo": _encode_array(
+                        attn.o_proj.weight.detach().cpu().numpy(),
+                        np.float32,
+                        f"layer{l}_wo",
+                    ),
+                    "w_gate": _encode_array(
+                        mlp.gate_proj.weight.detach().cpu().numpy(),
+                        np.float32,
+                        f"layer{l}_w_gate",
+                    ),
+                    "w_up": _encode_array(
+                        mlp.up_proj.weight.detach().cpu().numpy(),
+                        np.float32,
+                        f"layer{l}_w_up",
+                    ),
+                    "w_down": _encode_array(
+                        mlp.down_proj.weight.detach().cpu().numpy(),
+                        np.float32,
+                        f"layer{l}_w_down",
+                    ),
+                }
+            )
+
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(j, f, ensure_ascii=False, indent=2)
+
+        print(f"[OK] Exported weights to: {out_json}")
+        return out_json
+
+
 def main() -> None:
     out_dir = os.environ.get("DUMP_DIR", "dump_minimind")
     os.makedirs(out_dir, exist_ok=True)

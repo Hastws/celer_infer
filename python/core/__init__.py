@@ -39,12 +39,19 @@ def get_model(model_name: str, config_path: str = None):
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     with open(config_path) as f:
-        config_dict = json.load(f)
+        config_full = json.load(f)
+
+    # Extract actual model config (handle both nested and flat formats)
+    if "config" in config_full:
+        config_dict = config_full["config"]
+    else:
+        config_dict = config_full
 
     # Import and instantiate model
     if model_name == "minimind":
-        from .minimind_model import MiniMindForCausalLM
-        return MiniMindForCausalLM.from_pretrained(config_dict)
+        from .minimind_model import MiniMindConfig, MiniMindForCausalLM
+        cfg = MiniMindConfig(**config_dict)
+        return MiniMindForCausalLM(cfg)
 
     raise NotImplementedError(f"Model {model_name} not yet implemented")
 

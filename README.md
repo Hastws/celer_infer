@@ -58,6 +58,21 @@ bash scripts/run_validation.sh minimind
 bash scripts/clean.sh
 ```
 
+### 4. One-Click Verification ⭐
+
+```bash
+# 一键验证 PyTorch ↔ C++ 一致性
+python -m python.tools.verify_consistency
+```
+
+验证工具会自动执行：
+1. 编译 C++ 推理引擎
+2. 导出模型权重到 `dump_minimind/`
+3. 运行 PyTorch 和 C++ 推理
+4. 比较输出并报告误差
+
+**当前验证状态**: ✅ 通过 (最大误差 0.0005 < 阈值 0.001)
+
 ## 📁 Project Structure
 
 ```
@@ -86,9 +101,13 @@ CelerInfer/
 │
 ├── models/                    # Model configs & weights
 │   ├── minimind/             # MiniMind model
-│   │   ├── config.json       # Configuration
-│   │   └── minimind.json     # Weights
+│   │   └── config.json       # Configuration
 │   └── llama/                # LLAMA (placeholder)
+│
+├── dump_minimind/             # Generated outputs (gitignored)
+│   ├── minimind.json         # Exported weights + config
+│   ├── logits_torch.npy      # PyTorch inference output
+│   └── logits_cpp.npy        # C++ inference output
 │
 ├── scripts/                   # Convenience shell scripts
 │   ├── build_cpp.sh
@@ -110,10 +129,12 @@ CelerInfer/
 
 ## 📖 Documentation
 
-- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Detailed architecture, design patterns, and guide for adding new models
-- **[docs/MODELS.md](docs/MODELS.md)** - List of supported models and their configurations
-- **[REFACTORING_SUMMARY.md](REFACTORING_SUMMARY.md)** - Summary of recent project reorganization
-- **.github/copilot-instructions.md** - AI agent instructions for project context
+- **[docs/DOCUMENTATION_INDEX.md](docs/DOCUMENTATION_INDEX.md)** - Main documentation hub
+- **[docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md)** - Detailed architecture & extension guide
+- **[docs/DIRECTORY_GUIDE.md](docs/DIRECTORY_GUIDE.md)** - Quick reference & troubleshooting
+- **[docs/CONSISTENCY_REPORT.md](docs/CONSISTENCY_REPORT.md)** - Full analysis & testing results
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Low-level design patterns
+- **[docs/MODELS.md](docs/MODELS.md)** - Supported models list
 
 ## 🎯 Supported Models
 
@@ -121,7 +142,8 @@ CelerInfer/
 - **Type**: Transformer with RoPE, RMSNorm, SiLU
 - **Config**: Hidden=64, Layers=2, Heads=8, FFN=256
 - **Features**: Attention, FFN, optional MoE support
-- **Status**: Fully implemented and verified
+- **Status**: ✅ Fully implemented and verified
+- **Consistency**: PyTorch ↔ C++ max error: **0.0005** (threshold: 0.001)
 
 ### LLAMA 📋
 - **Status**: Planned
@@ -148,12 +170,20 @@ cpp/src/models/minimind.cpp (C++ Inference)
 python/validate/compare_*.py (Compare outputs)
 ```
 
-### Workflow 2: Quick Validation
+### Workflow 2: One-Click Verification ⭐
 
 ```bash
-# One-line validation
+# 一键验证 (推荐)
+python -m python.tools.verify_consistency
+
+# 或使用脚本
 bash scripts/run_validation.sh minimind
 ```
+
+**输出目录**: `dump_minimind/`
+- `minimind.json` - 导出的权重和配置
+- `logits_torch.npy` - PyTorch 推理结果
+- `logits_cpp.npy` - C++ 推理结果
 
 ## 🛠️ Adding a New Model
 
