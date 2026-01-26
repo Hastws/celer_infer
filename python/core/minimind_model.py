@@ -255,7 +255,7 @@ class Attention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, cfg: MiniMindConfig):
         super().__init__()
-        if cfg.intermediate_size is None:
+        if cfg.intermediate_size is None or cfg.intermediate_size <= 0:
             inter = int(cfg.hidden_size * 8 / 3)
             cfg.intermediate_size = 64 * ((inter + 63) // 64)
 

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <iostream>
+#include <memory>
 #include <vector>
 
 #include "tensor_op.hpp"
@@ -137,6 +138,18 @@ struct minimind_workspace {
 };
 
 // ============================
+// Helper 偏移函数
+// ============================
+// 使用 tensor_op 中定义的 off_4d，但这里我们需要调整参数
+// 对于 (B,S,H,D) 张量，off_4d(B, S, H, D, S*H, H, D) 
+// 实际上 tensor_op 中的 off_4d(i3, i2, i1, i0, a2, a1, a0)
+// 所以这是对的：off_4d(b, s, h, d, S*H, H, D)
+inline int64_t off_4d_bshd(int64_t b, int64_t s, int64_t h, int64_t d,
+                           int64_t S, int64_t H, int64_t D) {
+  return celer_infer::off_4d(b, s, h, d, S * H, H, D);
+}
+
+// ============================
 // High-level forward: inference path (dropout off)
 // You can extend for training by inserting dropout + aux_loss.
 // ============================
@@ -175,25 +188,25 @@ inline void minimind_attention_forward_infer(
   }
 
   // k_flat:
-  matmul_nt(ws->h1, B * S, HIDDEN, lw.w_k, KVH * D, HIDDEN, ws->ffn_mid, B * S,
+  matmul_nt(ws->h1, B * S, HIDDEN, lw.w_k, KVH * D, HIDDEN, ws->k, B * S,
             KVH * D);
   if (lw.b_k)
-    add_bias_lastdim_inplace(ws->ffn_mid, B * S, KVH * D, lw.b_k, KVH * D);
+    add_bias_lastdim_inplace(ws->k, B * S, KVH * D, lw.b_k, KVH * D);
 
   // Save K projection for layer 0
   if (layer_id == 0) {
-    g_k_flat_l0.assign(ws->ffn_mid, ws->ffn_mid + B * S * KVH * D);
+    g_k_flat_l0.assign(ws->k, ws->k + B * S * KVH * D);
   }
 
   // v_flat:
-  matmul_nt(ws->h1, B * S, HIDDEN, lw.w_v, KVH * D, HIDDEN, ws->ffn_up, B * S,
+  matmul_nt(ws->h1, B * S, HIDDEN, lw.w_v, KVH * D, HIDDEN, ws->v, B * S,
             KVH * D);
   if (lw.b_v)
-    add_bias_lastdim_inplace(ws->ffn_up, B * S, KVH * D, lw.b_v, KVH * D);
+    add_bias_lastdim_inplace(ws->v, B * S, KVH * D, lw.b_v, KVH * D);
 
   // Save V projection for layer 0
   if (layer_id == 0) {
-    g_v_flat_l0.assign(ws->ffn_up, ws->ffn_up + B * S * KVH * D);
+    g_v_flat_l0.assign(ws->v, ws->v + B * S * KVH * D);
   }
 
   // 3) view to (B,S,H,D) and (B,S,KVH,D)
@@ -206,22 +219,11 @@ inline void minimind_attention_forward_infer(
     for (int64_t b = 0; b < B; ++b) {
       for (int64_t s = 0; s < S; ++s) {
         const float* src = q_src + (b * S + s) * (H * D);
-        float* dst = ws->q + off_4d(b, s, 0, 0, S, H, D);  // (b,s,:,:)
+        float* dst = ws->q + off_4d_bshd(b, s, 0, 0, S, H, D);  // (b,s,:,:)
         std::memcpy(dst, src, static_cast<size_t>(H * D) * sizeof(float));
       }
     }
-    const float* k_src = ws->ffn_mid;  // (B,S,KVH*D)
-    const float* v_src = ws->ffn_up;   // (B,S,KVH*D)
-    for (int64_t b = 0; b < B; ++b) {
-      for (int64_t s = 0; s < S; ++s) {
-        std::memcpy(ws->k + off_4d(b, s, 0, 0, S, KVH, D),
-                    k_src + (b * S + s) * (KVH * D),
-                    static_cast<size_t>(KVH * D) * sizeof(float));
-        std::memcpy(ws->v + off_4d(b, s, 0, 0, S, KVH, D),
-                    v_src + (b * S + s) * (KVH * D),
-                    static_cast<size_t>(KVH * D) * sizeof(float));
-      }
-    }
+    // K and V already stored correctly since matmul outputs directly to ws->k and ws->v
   }
 
   // 4) RoPE (q,k) using (cos,sin)[pos : pos+S]
@@ -305,9 +307,7 @@ inline void minimind_attention_forward_infer(
   // merge heads copy (B,S,H,D)->(B,S,H*D)
   for (int64_t b = 0; b < B; ++b) {
     for (int64_t s = 0; s < S; ++s) {
-      const float* src = ws->attn_out_bshd + off_4d(b, s, 0, 0, S, H, D);
-      float* dst = ws->attn_out_flat + (b * S + s) * (H * D);
-      std::memcpy(dst, src, static_cast<size_t>(H * D) * sizeof(float));
+        const float* src = ws->attn_out_bshd + off_4d_bshd(b, s, 0, 0, S, H, D);
     }
   }
 
@@ -696,61 +696,72 @@ int main(int argc, char** argv) {
 
   // ===== workspace 分配 =====
   const int64_t T = S;  // 本次不测 cache，T=S
+  
+  // 使用堆分配而非栈分配，避免栈溢出
+  // Use raw arrays instead of unique_ptr<vector> to avoid potential issues
+  float* h0_data = new float[B * S * hidden]();
+  float* h1_data = new float[B * S * hidden]();
+  float* q_data = new float[B * S * heads * head_dim]();
+  float* k_data = new float[B * S * kv_heads * head_dim]();
+  float* v_data = new float[B * S * kv_heads * head_dim]();
+
+  float* k_rep_data = new float[B * T * kv_heads * head_dim]();
+  float* v_rep_data = new float[B * T * kv_heads * head_dim]();
+
+  float* q_bhsd_data = new float[B * heads * S * head_dim]();
+  float* k_bhtd_data = new float[B * kv_heads * T * head_dim]();
+  float* v_bhtd_data = new float[B * kv_heads * T * head_dim]();
+
+  float* scores_data = new float[B * heads * S * T]();
+  float* probs_data = new float[B * heads * S * T]();
+  float* attn_out_data = new float[B * heads * S * head_dim]();
+
+  float* attn_out_bshd_data = new float[B * S * heads * head_dim]();
+  float* attn_out_flat_data = new float[B * S * heads * head_dim]();
+
+  float* ffn_gate_data = new float[B * S * inter]();
+  float* ffn_up_data = new float[B * S * inter]();
+  float* ffn_mid_data = new float[B * S * inter]();
+  float* ffn_out_data = new float[B * S * hidden]();
+
+  float* logits_data = new float[B * S * vocab]();
+
   minimind_workspace ws;
-
-  std::vector<float> h0(B * S * hidden), h1(B * S * hidden);
-  std::vector<float> q(B * S * heads * head_dim);
-  std::vector<float> k(B * S * kv_heads * head_dim);
-  std::vector<float> v(B * S * kv_heads * head_dim);
-
-  std::vector<float> k_rep(B * T * heads * head_dim);
-  std::vector<float> v_rep(B * T * heads * head_dim);
-
-  std::vector<float> q_bhsd(B * heads * S * head_dim);
-  std::vector<float> k_bhtd(B * heads * T * head_dim);
-  std::vector<float> v_bhtd(B * heads * T * head_dim);
-
-  std::vector<float> scores(B * heads * S * T);
-  std::vector<float> probs(B * heads * S * T);
-  std::vector<float> attn_out(B * heads * S * head_dim);
-
-  std::vector<float> attn_out_bshd(B * S * heads * head_dim);
-  std::vector<float> attn_out_flat(B * S * heads * head_dim);
-
-  std::vector<float> ffn_gate(B * S * inter);
-  std::vector<float> ffn_up(B * S * inter);
-  std::vector<float> ffn_mid(B * S * inter);
-  std::vector<float> ffn_out(B * S * hidden);
-
-  std::vector<float> logits(B * S * vocab);
-
-  ws.h0 = h0.data();
-  ws.h1 = h1.data();
-  ws.q = q.data();
-  ws.k = k.data();
-  ws.v = v.data();
-  ws.k_rep = k_rep.data();
-  ws.v_rep = v_rep.data();
-  ws.q_bhsd = q_bhsd.data();
-  ws.k_bhtd = k_bhtd.data();
-  ws.v_bhtd = v_bhtd.data();
-  ws.scores = scores.data();
-  ws.probs = probs.data();
-  ws.attn_out = attn_out.data();
-  ws.attn_out_bshd = attn_out_bshd.data();
-  ws.attn_out_flat = attn_out_flat.data();
-  ws.ffn_gate = ffn_gate.data();
-  ws.ffn_up = ffn_up.data();
-  ws.ffn_mid = ffn_mid.data();
-  ws.ffn_out = ffn_out.data();
-  ws.logits = logits.data();
+  
+  ws.h0 = h0_data;
+  ws.h1 = h1_data;
+  ws.q = q_data;
+  ws.k = k_data;
+  ws.v = v_data;
+  ws.k_rep = k_rep_data;
+  ws.v_rep = v_rep_data;
+  ws.q_bhsd = q_bhsd_data;
+  ws.k_bhtd = k_bhtd_data;
+  ws.v_bhtd = v_bhtd_data;
+  ws.scores = scores_data;
+  ws.probs = probs_data;
+  ws.attn_out = attn_out_data;
+  ws.attn_out_bshd = attn_out_bshd_data;
+  ws.attn_out_flat = attn_out_flat_data;
+  ws.ffn_gate = ffn_gate_data;
+  ws.ffn_up = ffn_up_data;
+  ws.ffn_mid = ffn_mid_data;
+  ws.ffn_out = ffn_out_data;
+  ws.logits = logits_data;
+  
+  // Debug: verify pointers
+  std::cout << "[DEBUG] B=" << B << ", S=" << S << ", hidden=" << hidden << ", inter=" << inter << "\n";
+  std::cout << "[DEBUG] ffn_gate.size()=" << (B * S * inter) << ", data=" << (void*)ffn_gate_data << "\n";
+  std::cout << "[DEBUG] ws.h1=" << (void*)ws.h1 << "\n";
+  std::cout << "[DEBUG] ws.ffn_mid=" << (void*)ws.ffn_mid << "\n";
+  std::cout << "[DEBUG] ffn_mid.size()=" << (B * S * inter) << "\n";
 
   // ===== 运行 forward (timed) =====
   kv_cache* cache = nullptr;
 
   auto start = std::chrono::high_resolution_clock::now();
   minimind_forward_infer(cfg, W, input_ids.data(), B, S, attn_mask.data(), B, T,
-                         cache, &ws, logits.data(), B, S, vocab);
+                         cache, &ws, logits_data, B, S, vocab);
   auto end = std::chrono::high_resolution_clock::now();
   auto elapsed_ms =
       std::chrono::duration<double, std::milli>(end - start).count();
@@ -761,15 +772,15 @@ int main(int argc, char** argv) {
   std::cout << "[Timing] Forward pass: " << elapsed_ms << "ms\n";
 
   // 计算 logits 统计
-  float min_logit = logits[0];
-  float max_logit = logits[0];
+  float min_logit = logits_data[0];
+  float max_logit = logits_data[0];
   double mean_logit = 0.0;
-  for (const auto& val : logits) {
-    min_logit = std::min(min_logit, val);
-    max_logit = std::max(max_logit, val);
-    mean_logit += val;
+  for (int64_t i = 0; i < B * S * vocab; ++i) {
+    min_logit = std::min(min_logit, logits_data[i]);
+    max_logit = std::max(max_logit, logits_data[i]);
+    mean_logit += logits_data[i];
   }
-  mean_logit /= logits.size();
+  mean_logit /= (B * S * vocab);
 
   std::cout << "[Logits] Min: " << min_logit << ", Max: " << max_logit
             << ", Mean: " << mean_logit << "\n";
@@ -778,7 +789,7 @@ int main(int argc, char** argv) {
   // ===== 保存 logits =====
   std::string logits_path = dump_dir + "/logits_cpp.npy";
   // 简单保存为binary（numpy可以读，或者用 Python 处理）
-  write_f32(logits_path, logits.data(), logits.size());
+  write_f32(logits_path, logits_data, B * S * vocab);
   std::cout << "[OK] Saved logits to: " << logits_path << "\n";
 
   // 保存embedding输出以便调试（这是从minimind_forward_infer中保存的h0_embedding）
