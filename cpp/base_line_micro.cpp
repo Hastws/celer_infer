@@ -130,12 +130,12 @@ struct minimind_workspace {
 // Helper 偏移函数
 // ============================
 // 使用 tensor_op 中定义的 off_4d，但这里我们需要调整参数
-// 对于 (B,S,H,D) 张量，off_4d(B, S, H, D, S*H, H, D) 
-// 实际上 tensor_op 中的 off_4d(i3, i2, i1, i0, a2, a1, a0)
-// 所以这是对的：off_4d(b, s, h, d, S*H, H, D)
+// 对于 (B,S,H,D) 张量，计算偏移量
+// off_4d(i3, i2, i1, i0, a2, a1, a0) = ((i3 * a2 + i2) * a1 + i1) * a0 + i0
+// 对于 (B,S,H,D)：a2=S, a1=H, a0=D
 inline int64_t off_4d_bshd(int64_t b, int64_t s, int64_t h, int64_t d,
                            int64_t S, int64_t H, int64_t D) {
-  return celer_infer::off_4d(b, s, h, d, S * H, H, D);
+  return celer_infer::off_4d(b, s, h, d, S, H, D);
 }
 
 // ============================
@@ -579,69 +579,73 @@ int main(int argc, char** argv) {
   W.rope_sin = rope_sin.data();
   W.layers = layer_w.data();
 
-  // ===== workspace 分配 =====
+  // ===== workspace 分配 (使用 unique_ptr 自动管理内存) =====
   const int64_t T = S;  // 本次不测 cache，T=S
   
-  // 使用堆分配而非栈分配，避免栈溢出
-  // Use raw arrays instead of unique_ptr<vector> to avoid potential issues
-  float* h0_data = new float[B * S * hidden]();
-  float* h1_data = new float[B * S * hidden]();
-  float* q_data = new float[B * S * heads * head_dim]();
-  float* k_data = new float[B * S * kv_heads * head_dim]();
-  float* v_data = new float[B * S * kv_heads * head_dim]();
+  // 使用 unique_ptr<float[]> 管理堆内存，自动释放
+  auto h0_data = std::make_unique<float[]>(B * S * hidden);
+  auto h1_data = std::make_unique<float[]>(B * S * hidden);
+  auto q_data = std::make_unique<float[]>(B * S * heads * head_dim);
+  auto k_data = std::make_unique<float[]>(B * S * kv_heads * head_dim);
+  auto v_data = std::make_unique<float[]>(B * S * kv_heads * head_dim);
 
   // repeat_kv 输出的是 (B, T, heads, D)，不是 (B, T, kv_heads, D)
-  float* k_rep_data = new float[B * T * heads * head_dim]();
-  float* v_rep_data = new float[B * T * heads * head_dim]();
+  auto k_rep_data = std::make_unique<float[]>(B * T * heads * head_dim);
+  auto v_rep_data = std::make_unique<float[]>(B * T * heads * head_dim);
 
-  float* q_bhsd_data = new float[B * heads * S * head_dim]();
+  auto q_bhsd_data = std::make_unique<float[]>(B * heads * S * head_dim);
   // transpose 后输出的是 (B, H, T, D)，H = heads，不是 kv_heads
-  float* k_bhtd_data = new float[B * heads * T * head_dim]();
-  float* v_bhtd_data = new float[B * heads * T * head_dim]();
+  auto k_bhtd_data = std::make_unique<float[]>(B * heads * T * head_dim);
+  auto v_bhtd_data = std::make_unique<float[]>(B * heads * T * head_dim);
 
-  float* scores_data = new float[B * heads * S * T]();
-  float* probs_data = new float[B * heads * S * T]();
-  float* attn_out_data = new float[B * heads * S * head_dim]();
+  auto scores_data = std::make_unique<float[]>(B * heads * S * T);
+  auto probs_data = std::make_unique<float[]>(B * heads * S * T);
+  auto attn_out_data = std::make_unique<float[]>(B * heads * S * head_dim);
 
-  float* attn_out_bshd_data = new float[B * S * heads * head_dim]();
-  float* attn_out_flat_data = new float[B * S * heads * head_dim]();
+  auto attn_out_bshd_data = std::make_unique<float[]>(B * S * heads * head_dim);
+  auto attn_out_flat_data = std::make_unique<float[]>(B * S * heads * head_dim);
 
-  float* ffn_gate_data = new float[B * S * inter]();
-  float* ffn_up_data = new float[B * S * inter]();
-  float* ffn_mid_data = new float[B * S * inter]();
-  float* ffn_out_data = new float[B * S * hidden]();
+  auto ffn_gate_data = std::make_unique<float[]>(B * S * inter);
+  auto ffn_up_data = std::make_unique<float[]>(B * S * inter);
+  auto ffn_mid_data = std::make_unique<float[]>(B * S * inter);
+  auto ffn_out_data = std::make_unique<float[]>(B * S * hidden);
 
-  float* logits_data = new float[B * S * vocab]();
+  auto logits_data = std::make_unique<float[]>(B * S * vocab);
+  
+  // 初始化为0 (make_unique 默认不初始化，需要手动清零)
+  std::fill_n(h0_data.get(), B * S * hidden, 0.0f);
+  std::fill_n(h1_data.get(), B * S * hidden, 0.0f);
+  std::fill_n(logits_data.get(), B * S * vocab, 0.0f);
 
   minimind_workspace ws;
   
-  ws.h0 = h0_data;
-  ws.h1 = h1_data;
-  ws.q = q_data;
-  ws.k = k_data;
-  ws.v = v_data;
-  ws.k_rep = k_rep_data;
-  ws.v_rep = v_rep_data;
-  ws.q_bhsd = q_bhsd_data;
-  ws.k_bhtd = k_bhtd_data;
-  ws.v_bhtd = v_bhtd_data;
-  ws.scores = scores_data;
-  ws.probs = probs_data;
-  ws.attn_out = attn_out_data;
-  ws.attn_out_bshd = attn_out_bshd_data;
-  ws.attn_out_flat = attn_out_flat_data;
-  ws.ffn_gate = ffn_gate_data;
-  ws.ffn_up = ffn_up_data;
-  ws.ffn_mid = ffn_mid_data;
-  ws.ffn_out = ffn_out_data;
-  ws.logits = logits_data;
+  ws.h0 = h0_data.get();
+  ws.h1 = h1_data.get();
+  ws.q = q_data.get();
+  ws.k = k_data.get();
+  ws.v = v_data.get();
+  ws.k_rep = k_rep_data.get();
+  ws.v_rep = v_rep_data.get();
+  ws.q_bhsd = q_bhsd_data.get();
+  ws.k_bhtd = k_bhtd_data.get();
+  ws.v_bhtd = v_bhtd_data.get();
+  ws.scores = scores_data.get();
+  ws.probs = probs_data.get();
+  ws.attn_out = attn_out_data.get();
+  ws.attn_out_bshd = attn_out_bshd_data.get();
+  ws.attn_out_flat = attn_out_flat_data.get();
+  ws.ffn_gate = ffn_gate_data.get();
+  ws.ffn_up = ffn_up_data.get();
+  ws.ffn_mid = ffn_mid_data.get();
+  ws.ffn_out = ffn_out_data.get();
+  ws.logits = logits_data.get();
 
   // ===== 运行 forward (timed) =====
   kv_cache* cache = nullptr;
 
   auto start = std::chrono::high_resolution_clock::now();
   minimind_forward_infer(cfg, W, input_ids.data(), B, S, attn_mask.data(), B, T,
-                         cache, &ws, logits_data, B, S, vocab);
+                         cache, &ws, logits_data.get(), B, S, vocab);
   auto end = std::chrono::high_resolution_clock::now();
   auto elapsed_ms =
       std::chrono::duration<double, std::milli>(end - start).count();
@@ -668,13 +672,9 @@ int main(int argc, char** argv) {
 
   // ===== 保存 logits =====
   std::string logits_path = dump_dir + "/logits_cpp.npy";
-  write_f32(logits_path, logits_data, B * S * vocab);
+  write_f32(logits_path, logits_data.get(), B * S * vocab);
   std::cout << "[OK] Saved logits to: " << logits_path << "\n";
-
-  // ===== Use std::exit to bypass destructor phase =====
-  // The destructors of global/static variables cause segfaults
-  // All heap memory will be cleaned up by the OS on process exit
   std::cout << "[OK] Inference complete\n";
-  std::cout.flush();  // Ensure output is written
-  std::exit(0);  // Skip all dtors, let OS cleanup
+  
+  return 0;  // unique_ptr 会自动释放所有内存
 }
