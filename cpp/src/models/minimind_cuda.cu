@@ -125,36 +125,48 @@ __global__ void add_kernel(
   }
 }
 
-// RoPE kernel
+// RoPE kernel - rewritten with 1D linear indexing for stability
 __global__ void rope_kernel(
     float* __restrict__ q, float* __restrict__ k,
     const float* __restrict__ cos_cache,
     const float* __restrict__ sin_cache,
     int64_t B, int64_t S, int64_t H, int64_t KVH, int64_t D) {
   
-  // Grid: (S, H, B) for Q, we also do K with KVH heads
-  const int64_t b = blockIdx.z;
-  const int64_t h = blockIdx.y;
-  const int64_t s = blockIdx.x;
-  const int64_t d = threadIdx.x;
+  // Total elements to process for Q: B * S * H * (D/2) pairs
+  // We process one pair (d, d+1) per thread
+  int64_t total_q = B * S * H * (D / 2);
+  int64_t total_k = B * S * KVH * (D / 2);
   
-  if (d >= D / 2) return;
+  int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   
-  float cos_val = cos_cache[s * D + d * 2];
-  float sin_val = sin_cache[s * D + d * 2];
-  
-  // Apply to Q
-  if (h < H) {
-    int64_t q_idx = ((b * S + s) * H + h) * D + d * 2;
+  // Process Q
+  if (idx < total_q) {
+    int64_t pair = idx % (D / 2);
+    int64_t h = (idx / (D / 2)) % H;
+    int64_t s = (idx / (D / 2 * H)) % S;
+    int64_t b = idx / (D / 2 * H * S);
+    
+    float cos_val = cos_cache[s * D + pair * 2];
+    float sin_val = sin_cache[s * D + pair * 2];
+    
+    int64_t q_idx = ((b * S + s) * H + h) * D + pair * 2;
     float q0 = q[q_idx];
     float q1 = q[q_idx + 1];
     q[q_idx]     = q0 * cos_val - q1 * sin_val;
     q[q_idx + 1] = q0 * sin_val + q1 * cos_val;
   }
   
-  // Apply to K (only for KVH heads)
-  if (h < KVH) {
-    int64_t k_idx = ((b * S + s) * KVH + h) * D + d * 2;
+  // Process K (separate grid launch would be cleaner but this works)
+  if (idx < total_k) {
+    int64_t pair = idx % (D / 2);
+    int64_t h = (idx / (D / 2)) % KVH;
+    int64_t s = (idx / (D / 2 * KVH)) % S;
+    int64_t b = idx / (D / 2 * KVH * S);
+    
+    float cos_val = cos_cache[s * D + pair * 2];
+    float sin_val = sin_cache[s * D + pair * 2];
+    
+    int64_t k_idx = ((b * S + s) * KVH + h) * D + pair * 2;
     float k0 = k[k_idx];
     float k1 = k[k_idx + 1];
     k[k_idx]     = k0 * cos_val - k1 * sin_val;
@@ -520,9 +532,9 @@ void minimind_forward_cuda(
     cublas_matmul_nt(ctx.cublas, ctx.d_h1, B * S, cfg.hidden, ctx.d_wk[l], KVH * D, ctx.d_k);
     cublas_matmul_nt(ctx.cublas, ctx.d_h1, B * S, cfg.hidden, ctx.d_wv[l], KVH * D, ctx.d_v);
     
-    // RoPE
-    dim3 rope_grid(S, H, B);
-    rope_kernel<<<rope_grid, D / 2>>>(
+    // RoPE - use 1D grid
+    int64_t rope_total = std::max(B * S * H * (D / 2), B * S * KVH * (D / 2));
+    rope_kernel<<<(rope_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
         ctx.d_q, ctx.d_k, ctx.d_rope_cos, ctx.d_rope_sin, B, S, H, KVH, D);
     
     // Repeat KV
@@ -543,15 +555,17 @@ void minimind_forward_cuda(
         ctx.d_v_rep, ctx.d_v_bhsd, B, T, H, D);
     
     // Attention: scores = Q @ K^T (batched)
+    // Q: (B, H, S, D), K: (B, H, T, D), scores: (B, H, S, T)
+    // For batched gemm, we treat B*H as the batch dimension
     float alpha = 1.0f, beta = 0.0f;
     CUBLAS_CHECK(cublasSgemmStridedBatched(ctx.cublas,
         CUBLAS_OP_T, CUBLAS_OP_N,
         T, S, D,
         &alpha,
-        ctx.d_k_bhsd, D, H * T * D,
-        ctx.d_q_bhsd, D, H * S * D,
+        ctx.d_k_bhsd, D, T * D,  // strideA = T * D (per-head stride)
+        ctx.d_q_bhsd, D, S * D,  // strideB = S * D (per-head stride)
         &beta,
-        ctx.d_scores, T, H * S * T,
+        ctx.d_scores, T, S * T,  // strideC = S * T (per-head stride)
         B * H));
     
     // Causal softmax
@@ -560,14 +574,15 @@ void minimind_forward_cuda(
         ctx.d_scores, B, H, S, T, scale);
     
     // Attn @ V
+    // scores: (B, H, S, T), V: (B, H, T, D), out: (B, H, S, D)
     CUBLAS_CHECK(cublasSgemmStridedBatched(ctx.cublas,
         CUBLAS_OP_N, CUBLAS_OP_N,
         D, S, T,
         &alpha,
-        ctx.d_v_bhsd, D, H * T * D,
-        ctx.d_scores, T, H * S * T,
+        ctx.d_v_bhsd, D, T * D,     // strideA = T * D
+        ctx.d_scores, T, S * T,     // strideB = S * T
         &beta,
-        ctx.d_attn_out, D, H * S * D,
+        ctx.d_attn_out, D, S * D,   // strideC = S * D
         B * H));
     
     // Transpose back: (B,H,S,D) -> (B,S,H,D)
