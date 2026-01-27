@@ -1,13 +1,24 @@
 cmake_minimum_required(VERSION 3.16)
 project(celer_infer)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 
 # ============================================================================
 # Build options
 # ============================================================================
 option(ENABLE_SIMD "Enable AVX2 SIMD optimizations" ON)
 option(ENABLE_CUDA "Enable CUDA GPU support" OFF)
+option(ENABLE_OPENMP "Enable OpenMP parallelization" ON)
+
+# ============================================================================
+# Find OpenMP
+# ============================================================================
+if(ENABLE_OPENMP)
+    find_package(OpenMP REQUIRED)
+    if(OpenMP_CXX_FOUND)
+        message(STATUS "OpenMP found: ${OpenMP_CXX_VERSION}")
+    endif()
+endif()
 
 # ============================================================================
 # Include directories
@@ -52,6 +63,17 @@ else()
 endif()
 
 # ============================================================================
+# MiniMind Extreme - All optimizations: OpenMP + AVX2/VNNI + Tiling + Prefetch
+# ============================================================================
+add_executable(minimind_extreme src/models/minimind_extreme.cpp)
+set_target_properties(minimind_extreme PROPERTIES
+    COMPILE_FLAGS "${COMMON_FLAGS} -O3 -mavx2 -mfma -march=native -funroll-loops -ftree-vectorize"
+)
+if(ENABLE_OPENMP AND OpenMP_CXX_FOUND)
+    target_link_libraries(minimind_extreme PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+# ============================================================================
 # CUDA support (optional)
 # ============================================================================
 if(ENABLE_CUDA)
@@ -65,7 +87,7 @@ if(ENABLE_CUDA)
     
     enable_language(CUDA)
     
-    # MiniMind CUDA executable (standalone .cu file)
+    # MiniMind CUDA FP32 executable
     add_executable(minimind_cuda 
         src/models/minimind_cuda.cu
     )
@@ -81,6 +103,23 @@ if(ENABLE_CUDA)
         CUDA_SEPARABLE_COMPILATION OFF
         CUDA_ARCHITECTURES "89"
     )
+    
+    # MiniMind CUDA FP16 + Tensor Core executable
+    add_executable(minimind_cuda_fp16 
+        src/models/minimind_cuda_fp16.cu
+    )
+    target_include_directories(minimind_cuda_fp16 PRIVATE 
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        ${CUDA_PATH}/include
+    )
+    target_link_directories(minimind_cuda_fp16 PRIVATE
+        ${CUDA_PATH}/lib64
+    )
+    target_link_libraries(minimind_cuda_fp16 PRIVATE cudart cublas)
+    set_target_properties(minimind_cuda_fp16 PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_ARCHITECTURES "89"
+    )
 endif()
 
 # ============================================================================
@@ -89,10 +128,11 @@ endif()
 message(STATUS "CelerInfer build configuration:")
 message(STATUS "  SIMD (AVX2): ${ENABLE_SIMD}")
 message(STATUS "  CUDA: ${ENABLE_CUDA}")
-message(STATUS "  Targets: minimind, minimind_unified" )
+message(STATUS "  OpenMP: ${ENABLE_OPENMP}")
+message(STATUS "  Targets: minimind, minimind_unified, minimind_extreme" )
 if(ENABLE_SIMD)
     message(STATUS "           minimind_simd")
 endif()
 if(ENABLE_CUDA)
-    message(STATUS "           minimind_cuda")
+    message(STATUS "           minimind_cuda, minimind_cuda_fp16")
 endif()
