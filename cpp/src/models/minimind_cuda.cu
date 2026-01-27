@@ -55,7 +55,8 @@ constexpr int WARP_SIZE = 32;
 // CUDA Kernels
 // ============================================================================
 
-// RMS Normalization kernel
+// RMS Normalization kernel - HIGH PRECISION VERSION
+// Uses double precision for reduction to minimize accumulated error
 __global__ void rms_norm_kernel(
     const float* __restrict__ x,
     const float* __restrict__ weight,
@@ -66,27 +67,28 @@ __global__ void rms_norm_kernel(
   const float* row_in = x + row * hidden;
   float* row_out = out + row * hidden;
   
-  extern __shared__ float shared[];
+  extern __shared__ double shared_d[];  // Use double for reduction
   
-  // Compute sum of squares
-  float local_ss = 0.0f;
+  // Compute sum of squares using double precision
+  double local_ss = 0.0;
   for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-    float val = row_in[i];
+    double val = static_cast<double>(row_in[i]);
     local_ss += val * val;
   }
-  shared[threadIdx.x] = local_ss;
+  shared_d[threadIdx.x] = local_ss;
   __syncthreads();
   
-  // Block reduction
+  // Block reduction in double precision
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (threadIdx.x < stride) {
-      shared[threadIdx.x] += shared[threadIdx.x + stride];
+      shared_d[threadIdx.x] += shared_d[threadIdx.x + stride];
     }
     __syncthreads();
   }
   
-  float ms = shared[0] / static_cast<float>(hidden);
-  float inv_rms = rsqrtf(ms + eps);
+  // Compute inv_rms in double, then convert to float
+  double ms = shared_d[0] / static_cast<double>(hidden);
+  float inv_rms = static_cast<float>(1.0 / sqrt(ms + static_cast<double>(eps)));
   
   // Normalize
   for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
@@ -94,12 +96,14 @@ __global__ void rms_norm_kernel(
   }
 }
 
-// SiLU activation kernel
+// SiLU activation kernel - HIGH PRECISION VERSION
 __global__ void silu_kernel(float* __restrict__ x, int64_t n) {
   int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n) {
-    float val = x[idx];
-    x[idx] = val / (1.0f + expf(-val));
+    // Use double precision for sigmoid computation to match PyTorch
+    double val = static_cast<double>(x[idx]);
+    double sigmoid = 1.0 / (1.0 + exp(-val));
+    x[idx] = static_cast<float>(val * sigmoid);
   }
 }
 
@@ -125,52 +129,79 @@ __global__ void add_kernel(
   }
 }
 
-// RoPE kernel - rewritten with 1D linear indexing for stability
-__global__ void rope_kernel(
-    float* __restrict__ q, float* __restrict__ k,
+// RoPE kernel - HIGH PRECISION VERSION (rotate_half style)
+// Matches PyTorch's rotate_half implementation:
+//   rotate_half(x): (-x[..., half:], x[..., :half])
+//   out = x * cos + rotate_half(x) * sin
+// This kernel processes Q and K separately, in-place using shared memory
+__global__ void rope_q_kernel(
+    float* __restrict__ q,
     const float* __restrict__ cos_cache,
     const float* __restrict__ sin_cache,
-    int64_t B, int64_t S, int64_t H, int64_t KVH, int64_t D) {
+    int64_t B, int64_t S, int64_t H, int64_t D) {
   
-  // Total elements to process for Q: B * S * H * (D/2) pairs
-  // We process one pair (d, d+1) per thread
-  int64_t total_q = B * S * H * (D / 2);
-  int64_t total_k = B * S * KVH * (D / 2);
+  // Each block processes one (b, s, h) position - entire D dimension
+  int64_t bsh = blockIdx.x;
+  int64_t h = bsh % H;
+  int64_t s = (bsh / H) % S;
+  int64_t b = bsh / (H * S);
   
-  int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t half_D = D / 2;
+  float* q_ptr = q + ((b * S + s) * H + h) * D;
   
-  // Process Q
-  if (idx < total_q) {
-    int64_t pair = idx % (D / 2);
-    int64_t h = (idx / (D / 2)) % H;
-    int64_t s = (idx / (D / 2 * H)) % S;
-    int64_t b = idx / (D / 2 * H * S);
-    
-    float cos_val = cos_cache[s * D + pair * 2];
-    float sin_val = sin_cache[s * D + pair * 2];
-    
-    int64_t q_idx = ((b * S + s) * H + h) * D + pair * 2;
-    float q0 = q[q_idx];
-    float q1 = q[q_idx + 1];
-    q[q_idx]     = q0 * cos_val - q1 * sin_val;
-    q[q_idx + 1] = q0 * sin_val + q1 * cos_val;
+  // Load q into shared memory
+  extern __shared__ float smem[];  // size = D
+  for (int i = threadIdx.x; i < D; i += blockDim.x) {
+    smem[i] = q_ptr[i];
   }
+  __syncthreads();
   
-  // Process K (separate grid launch would be cleaner but this works)
-  if (idx < total_k) {
-    int64_t pair = idx % (D / 2);
-    int64_t h = (idx / (D / 2)) % KVH;
-    int64_t s = (idx / (D / 2 * KVH)) % S;
-    int64_t b = idx / (D / 2 * KVH * S);
+  // Apply RoPE with rotate_half
+  for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    double cos_val = static_cast<double>(cos_cache[s * D + d]);
+    double sin_val = static_cast<double>(sin_cache[s * D + d]);
+    double q_d = static_cast<double>(smem[d]);
     
-    float cos_val = cos_cache[s * D + pair * 2];
-    float sin_val = sin_cache[s * D + pair * 2];
+    // rotate_half: d < D/2 -> -smem[d + D/2], d >= D/2 -> smem[d - D/2]
+    double q_rot = (d < half_D) 
+                   ? -static_cast<double>(smem[d + half_D])
+                   : static_cast<double>(smem[d - half_D]);
     
-    int64_t k_idx = ((b * S + s) * KVH + h) * D + pair * 2;
-    float k0 = k[k_idx];
-    float k1 = k[k_idx + 1];
-    k[k_idx]     = k0 * cos_val - k1 * sin_val;
-    k[k_idx + 1] = k0 * sin_val + k1 * cos_val;
+    q_ptr[d] = static_cast<float>(q_d * cos_val + q_rot * sin_val);
+  }
+}
+
+__global__ void rope_k_kernel(
+    float* __restrict__ k,
+    const float* __restrict__ cos_cache,
+    const float* __restrict__ sin_cache,
+    int64_t B, int64_t S, int64_t KVH, int64_t D) {
+  
+  // Each block processes one (b, s, kvh) position
+  int64_t bsh = blockIdx.x;
+  int64_t h = bsh % KVH;
+  int64_t s = (bsh / KVH) % S;
+  int64_t b = bsh / (KVH * S);
+  
+  int64_t half_D = D / 2;
+  float* k_ptr = k + ((b * S + s) * KVH + h) * D;
+  
+  extern __shared__ float smem[];
+  for (int i = threadIdx.x; i < D; i += blockDim.x) {
+    smem[i] = k_ptr[i];
+  }
+  __syncthreads();
+  
+  for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    double cos_val = static_cast<double>(cos_cache[s * D + d]);
+    double sin_val = static_cast<double>(sin_cache[s * D + d]);
+    double k_d = static_cast<double>(smem[d]);
+    
+    double k_rot = (d < half_D)
+                   ? -static_cast<double>(smem[d + half_D])
+                   : static_cast<double>(smem[d - half_D]);
+    
+    k_ptr[d] = static_cast<float>(k_d * cos_val + k_rot * sin_val);
   }
 }
 
@@ -236,7 +267,8 @@ __global__ void transpose_bhsd_to_bshd_kernel(
   out[idx] = in[in_idx];
 }
 
-// Causal softmax kernel (fused scale + mask + softmax)
+// Causal softmax kernel - HIGH PRECISION VERSION
+// Uses double precision for sum reduction to minimize error
 __global__ void causal_softmax_kernel(
     float* __restrict__ scores,
     int64_t B, int64_t H, int64_t S, int64_t T,
@@ -248,7 +280,10 @@ __global__ void causal_softmax_kernel(
   
   float* row_data = scores + row * T;
   
-  extern __shared__ float shared[];
+  // Shared memory: first half for float (max), second half for double (sum)
+  extern __shared__ char shared_mem[];
+  float* shared_f = reinterpret_cast<float*>(shared_mem);
+  double* shared_d = reinterpret_cast<double*>(shared_mem);
   
   const float neg_inf = -1e9f;
   
@@ -260,35 +295,39 @@ __global__ void causal_softmax_kernel(
     row_data[sk] = val;
     local_max = fmaxf(local_max, val);
   }
-  shared[threadIdx.x] = local_max;
+  shared_f[threadIdx.x] = local_max;
   __syncthreads();
   
   // Reduce max
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (threadIdx.x < stride) {
-      shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+      shared_f[threadIdx.x] = fmaxf(shared_f[threadIdx.x], shared_f[threadIdx.x + stride]);
     }
     __syncthreads();
   }
-  float max_val = shared[0];
+  float max_val = shared_f[0];
+  __syncthreads();  // Ensure all threads have max_val before reusing shared mem
   
-  // Exp and sum
-  float local_sum = 0.0f;
+  // Exp and sum using DOUBLE precision for accumulation
+  double local_sum = 0.0;
   for (int sk = threadIdx.x; sk < T; sk += blockDim.x) {
-    float exp_val = expf(row_data[sk] - max_val);
-    row_data[sk] = exp_val;
+    // Use exp() in double for precision
+    double exp_val = exp(static_cast<double>(row_data[sk] - max_val));
+    row_data[sk] = static_cast<float>(exp_val);
     local_sum += exp_val;
   }
-  shared[threadIdx.x] = local_sum;
+  shared_d[threadIdx.x] = local_sum;
   __syncthreads();
   
+  // Reduce sum in double precision
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (threadIdx.x < stride) {
-      shared[threadIdx.x] += shared[threadIdx.x + stride];
+      shared_d[threadIdx.x] += shared_d[threadIdx.x + stride];
     }
     __syncthreads();
   }
-  float inv_sum = 1.0f / shared[0];
+  double sum_d = shared_d[0];
+  float inv_sum = static_cast<float>(1.0 / sum_d);
   
   // Normalize
   for (int sk = threadIdx.x; sk < T; sk += blockDim.x) {
@@ -523,8 +562,8 @@ void minimind_forward_cuda(
   
   // Layer stack
   for (int64_t l = 0; l < cfg.n_layers; ++l) {
-    // Pre-attn RMSNorm
-    rms_norm_kernel<<<B * S, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(
+    // Pre-attn RMSNorm (uses double precision shared memory)
+    rms_norm_kernel<<<B * S, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
         ctx.d_h0, ctx.d_rms_attn[l], ctx.d_h1, cfg.hidden, cfg.rms_eps);
     
     // Q, K, V projections
@@ -532,10 +571,14 @@ void minimind_forward_cuda(
     cublas_matmul_nt(ctx.cublas, ctx.d_h1, B * S, cfg.hidden, ctx.d_wk[l], KVH * D, ctx.d_k);
     cublas_matmul_nt(ctx.cublas, ctx.d_h1, B * S, cfg.hidden, ctx.d_wv[l], KVH * D, ctx.d_v);
     
-    // RoPE - use 1D grid
-    int64_t rope_total = std::max(B * S * H * (D / 2), B * S * KVH * (D / 2));
-    rope_kernel<<<(rope_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
-        ctx.d_q, ctx.d_k, ctx.d_rope_cos, ctx.d_rope_sin, B, S, H, KVH, D);
+    // RoPE - separate kernels for Q and K using shared memory for rotate_half
+    int64_t q_blocks = B * S * H;
+    int64_t k_blocks = B * S * KVH;
+    int64_t rope_threads = std::min((int64_t)BLOCK_SIZE, D);
+    rope_q_kernel<<<q_blocks, rope_threads, D * sizeof(float)>>>(
+        ctx.d_q, ctx.d_rope_cos, ctx.d_rope_sin, B, S, H, D);
+    rope_k_kernel<<<k_blocks, rope_threads, D * sizeof(float)>>>(
+        ctx.d_k, ctx.d_rope_cos, ctx.d_rope_sin, B, S, KVH, D);
     
     // Repeat KV
     int64_t n_rep = H / KVH;
@@ -568,9 +611,9 @@ void minimind_forward_cuda(
         ctx.d_scores, T, S * T,  // strideC = S * T (per-head stride)
         B * H));
     
-    // Causal softmax
+    // Causal softmax (uses double precision shared memory for sum reduction)
     int total_rows = B * H * S;
-    causal_softmax_kernel<<<total_rows, std::min((int64_t)BLOCK_SIZE, T), BLOCK_SIZE * sizeof(float)>>>(
+    causal_softmax_kernel<<<total_rows, std::min((int64_t)BLOCK_SIZE, T), BLOCK_SIZE * sizeof(double)>>>(
         ctx.d_scores, B, H, S, T, scale);
     
     // Attn @ V
@@ -598,8 +641,8 @@ void minimind_forward_cuda(
         ctx.d_h0, ctx.d_h1, ctx.d_h0, total);
     
     // FFN
-    // Pre-FFN RMSNorm
-    rms_norm_kernel<<<B * S, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(
+    // Pre-FFN RMSNorm (uses double precision shared memory)
+    rms_norm_kernel<<<B * S, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
         ctx.d_h0, ctx.d_rms_ffn[l], ctx.d_h1, cfg.hidden, cfg.rms_eps);
     
     // Gate and Up projections
@@ -620,8 +663,8 @@ void minimind_forward_cuda(
         ctx.d_h0, ctx.d_ffn_out, ctx.d_h0, total);
   }
   
-  // Final RMSNorm
-  rms_norm_kernel<<<B * S, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(
+  // Final RMSNorm (uses double precision shared memory)
+  rms_norm_kernel<<<B * S, BLOCK_SIZE, BLOCK_SIZE * sizeof(double)>>>(
       ctx.d_h0, ctx.d_final_rms, ctx.d_h1, cfg.hidden, cfg.rms_eps);
   
   // LM head
