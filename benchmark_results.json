@@ -1,0 +1,82 @@
+{
+  "config": {
+    "warmup_runs": 5,
+    "benchmark_runs": 20
+  },
+  "minimind": {
+    "pytorch": {
+      "latency_ms": 12.048333787242882,
+      "std_ms": 1.157400306633717,
+      "verified": true,
+      "error": ""
+    },
+    "baseline": {
+      "latency_ms": 93.1974,
+      "std_ms": 0,
+      "verified": true,
+      "error": ""
+    },
+    "simd": {
+      "latency_ms": 23.7214,
+      "std_ms": 0,
+      "verified": true,
+      "error": ""
+    },
+    "extreme": {
+      "latency_ms": 82.4737,
+      "std_ms": 0,
+      "verified": true,
+      "error": ""
+    },
+    "cuda": {
+      "latency_ms": 1.0124,
+      "std_ms": 0,
+      "verified": true,
+      "error": ""
+    },
+    "cuda_fp16": {
+      "latency_ms": 0.635412,
+      "std_ms": 0,
+      "verified": true,
+      "error": ""
+    }
+  },
+  "dit": {
+    "pytorch": {
+      "latency_ms": 37.26554500171915,
+      "std_ms": 0.7214073836061692,
+      "verified": true,
+      "error": ""
+    },
+    "baseline": {
+      "latency_ms": 52.8054,
+      "std_ms": 0,
+      "verified": true,
+      "error": ""
+    },
+    "simd": {
+      "latency_ms": 10.9005,
+      "std_ms": 0,
+      "verified": true,
+      "error": ""
+    },
+    "extreme": {
+      "latency_ms": 3.55838,
+      "std_ms": 0,
+      "verified": true,
+      "error": ""
+    },
+    "cuda": {
+      "latency_ms": 1.74958,
+      "std_ms": 0,
+      "verified": true,
+      "error": ""
+    },
+    "cuda_fp16": {
+      "latency_ms": 0.233241,
+      "std_ms": 0,
+      "verified": true,
+      "error": ""
+    }
+  }
+}

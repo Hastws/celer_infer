@@ -123,16 +123,70 @@ if(ENABLE_CUDA)
 endif()
 
 # ============================================================================
+# DiT (Diffusion Transformer) - Autonomous Driving Planning
+# ============================================================================
+add_executable(dit src/models/dit.cpp)
+set_target_properties(dit PROPERTIES
+    COMPILE_FLAGS "${COMMON_FLAGS} -O2 -g"
+)
+
+# DiT SIMD (AVX2 vectorized)
+if(ENABLE_SIMD)
+    add_executable(dit_simd src/models/dit_simd.cpp)
+    set_target_properties(dit_simd PROPERTIES
+        COMPILE_FLAGS "${COMMON_FLAGS} -O3 -mavx2 -mfma -march=native"
+    )
+endif()
+
+# DiT Extreme - OpenMP + AVX2 + Tiling
+add_executable(dit_extreme src/models/dit_extreme.cpp)
+set_target_properties(dit_extreme PROPERTIES
+    COMPILE_FLAGS "${COMMON_FLAGS} -O3 -mavx2 -mfma -march=native -funroll-loops -ftree-vectorize"
+)
+if(ENABLE_OPENMP AND OpenMP_CXX_FOUND)
+    target_link_libraries(dit_extreme PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+# DiT CUDA
+if(ENABLE_CUDA)
+    add_executable(dit_cuda src/models/dit_cuda.cu)
+    target_include_directories(dit_cuda PRIVATE 
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        ${CUDA_PATH}/include
+    )
+    target_link_directories(dit_cuda PRIVATE ${CUDA_PATH}/lib64)
+    target_link_libraries(dit_cuda PRIVATE cudart cublas)
+    set_target_properties(dit_cuda PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_ARCHITECTURES "89"
+    )
+    
+    add_executable(dit_cuda_fp16 src/models/dit_cuda_fp16.cu)
+    target_include_directories(dit_cuda_fp16 PRIVATE 
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        ${CUDA_PATH}/include
+    )
+    target_link_directories(dit_cuda_fp16 PRIVATE ${CUDA_PATH}/lib64)
+    target_link_libraries(dit_cuda_fp16 PRIVATE cudart cublas)
+    set_target_properties(dit_cuda_fp16 PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_ARCHITECTURES "89"
+    )
+endif()
+
+# ============================================================================
 # Summary message
 # ============================================================================
 message(STATUS "CelerInfer build configuration:")
 message(STATUS "  SIMD (AVX2): ${ENABLE_SIMD}")
 message(STATUS "  CUDA: ${ENABLE_CUDA}")
 message(STATUS "  OpenMP: ${ENABLE_OPENMP}")
-message(STATUS "  Targets: minimind, minimind_unified, minimind_extreme" )
+message(STATUS "  MiniMind targets: minimind, minimind_unified, minimind_extreme" )
+message(STATUS "  DiT targets: dit, dit_extreme")
 if(ENABLE_SIMD)
-    message(STATUS "           minimind_simd")
+    message(STATUS "           minimind_simd, dit_simd")
 endif()
 if(ENABLE_CUDA)
     message(STATUS "           minimind_cuda, minimind_cuda_fp16")
+    message(STATUS "           dit_cuda, dit_cuda_fp16")
 endif()
