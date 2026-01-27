@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "tensor_op.hpp"
+#include "nlohmann/json.hpp"
 
 using namespace celer_infer;
 
@@ -401,9 +402,6 @@ inline void minimind_forward_infer(const minimind_config& cfg,
 #include <iostream>
 #include <string>
 #include <vector>
-
-#include "tensor_op.hpp"
-#include "third_party/nlohmann/json.hpp"
 
 using json = nlohmann::json;
 

@@ -141,7 +141,7 @@ def run_single_test(
         return False, float('inf'), f"PyTorch推理失败: {e}"
     
     # Step 3: C++ baseline 推理
-    cpp_baseline = os.path.join(project_root, 'cpp', 'build', 'base_line_micro')
+    cpp_baseline = os.path.join(project_root, 'cpp', 'build', 'minimind')
     json_path = os.path.join(dump_dir, 'minimind.json')
     
     ret, out_baseline, err = run_command(f'{cpp_baseline} {json_path} {dump_dir}', cwd=project_root)
@@ -152,7 +152,7 @@ def run_single_test(
         print(out_baseline)
     
     # Step 3b: C++ SIMD 推理
-    cpp_simd = os.path.join(project_root, 'cpp', 'build', 'base_line_simd')
+    cpp_simd = os.path.join(project_root, 'cpp', 'build', 'minimind_simd')
     out_simd = ""
     if run_simd and os.path.exists(cpp_simd):
         ret, out_simd, err = run_command(f'{cpp_simd} {json_path} {dump_dir}', cwd=project_root)

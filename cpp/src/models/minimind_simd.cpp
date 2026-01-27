@@ -1,4 +1,4 @@
-// base_line_simd.cpp - SIMD-optimized MiniMind inference
+// minimind_simd.cpp - SIMD-optimized MiniMind inference
 // ============================================================================
 // Uses AVX2-optimized tensor operations for improved performance.
 // ============================================================================
@@ -14,6 +14,8 @@
 
 // Then include SIMD-optimized versions (will use simd:: namespace)
 #include "tensor_op_simd.hpp"
+
+#include "nlohmann/json.hpp"
 
 using namespace celer_infer;
 
@@ -299,7 +301,6 @@ inline void minimind_forward_simd(const minimind_config& cfg,
 
 #include <chrono>
 #include <fstream>
-#include "third_party/nlohmann/json.hpp"
 
 using json = nlohmann::json;
 
